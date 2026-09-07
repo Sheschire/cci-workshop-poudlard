@@ -1,0 +1,18 @@
+{
+  "_comment": "Index template for the `logs-docker` data stream: container stdout/stderr collected by Fluent Bit.",
+  "index_patterns": ["logs-docker*"],
+  "data_stream": {},
+  "priority": 200,
+  "composed_of": ["dockerwarts-logs-common"],
+  "template": {
+    "mappings": {
+      "properties": {
+        "image":      { "type": "keyword" },
+        "node_id":    { "type": "keyword" },
+        "task_id":    { "type": "keyword" },
+        "exception":  { "type": "text" }
+      }
+    }
+  },
+  "_meta": { "managed_by": "scripts/es-init.sh" }
+}

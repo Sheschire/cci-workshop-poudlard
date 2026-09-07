@@ -1,0 +1,128 @@
+# =============================================================================
+# MariaDB 11.4 — Galera cluster configuration.
+#
+# Mounted read-only at /etc/mysql/conf.d/galera.cnf on galera-1, galera-2 and
+# galera-3. The three services share this file; what differs between them
+# (node name, node address) comes from environment variables read by the
+# `wsrep_node_*` settings below.
+#
+# Documented section by section in docs/04-composants/galera.md.
+# Decision: ADR-0005 — MariaDB Galera + HAProxy single writer.
+# =============================================================================
+
+[mysqld]
+# --- Baseline required by Galera ---------------------------------------------
+# These four are NOT optional: Galera refuses to start, or silently corrupts
+# replication, without them.
+binlog_format                  = ROW
+# Galera replicates row images; STATEMENT would replay non-deterministic SQL
+# (NOW(), UUID(), auto-increment) differently on each node.
+default_storage_engine         = InnoDB
+# Only InnoDB is transactional and therefore replicable by Galera. A MyISAM
+# table would live on one node only — GLPI creates none, but a plugin might.
+innodb_autoinc_lock_mode        = 2
+# "interleaved": mandatory in multi-master. Modes 0 and 1 take a table-level
+# lock for AUTO_INCREMENT, which Galera cannot certify across nodes.
+innodb_doublewrite              = 1
+# Kept ON: the doublewrite buffer is what makes a torn page recoverable after
+# a hard node loss, which is exactly the scenario `make chaos` produces.
+
+# --- Cluster identity ---------------------------------------------------------
+wsrep_on                        = ON
+wsrep_provider                  = /usr/lib/galera/libgalera_smm.so
+wsrep_cluster_name              = dockerwarts
+# Every member, by Swarm service name. Swarm's internal DNS resolves these to
+# the VIP of each service, which is stable across rescheduling — unlike a
+# container IP.
+wsrep_cluster_address           = gcomm://galera-1,galera-2,galera-3
+
+# Per-node identity, injected by the entrypoint wrapper from the service's
+# environment (WSREP_NODE_NAME / WSREP_NODE_ADDRESS). See
+# images/../stacks/data.yml.
+wsrep_node_name                 = ${WSREP_NODE_NAME}
+wsrep_node_address              = ${WSREP_NODE_ADDRESS}
+
+# --- State transfer -----------------------------------------------------------
+# mariabackup: a *non-blocking* physical transfer. The alternatives are worse:
+#   rsync    blocks the donor for the whole copy (minutes of read-only)
+#   mysqldump  logical, far slower, and also blocking
+# A node joining after a crash must not freeze the cluster serving GLPI.
+wsrep_sst_method                = mariabackup
+wsrep_sst_auth                  = sst:${MARIADB_SST_PASSWORD}
+
+# Prefer an IST (incremental) over a full SST whenever possible: 512 MB of
+# writeset cache covers a node absent for a few minutes, which is the common
+# case (reboot, rescheduling) and turns a 2-minute SST into a 2-second IST.
+wsrep_provider_options          = "gcache.size=512M; gcache.page_size=128M; gmcast.segment=0; evs.suspect_timeout=PT10S; evs.inactive_timeout=PT30S; evs.install_timeout=PT15S"
+
+# --- Replication behaviour ----------------------------------------------------
+wsrep_slave_threads             = 4
+# Parallel apply. 4 ≈ the vCPU count of a node; beyond that the certification
+# ordering becomes the bottleneck.
+wsrep_certify_nonPK             = ON
+# Galera needs a primary key to certify a row. ON makes it generate one for
+# tables that lack it — some GLPI plugin tables do.
+wsrep_retry_autocommit          = 3
+# Transparently retry a single-statement autocommit that lost certification,
+# rather than surfacing a deadlock error to GLPI.
+wsrep_sync_wait                 = 1
+# Causal reads on SELECT: a read issued right after a write sees that write,
+# even if the two land on different nodes. Costs a little latency and removes
+# a whole class of "I just saved it and it is not there" bugs. HAProxy already
+# routes everything to one node, so this only matters during a failover.
+
+# --- Durability ---------------------------------------------------------------
+innodb_flush_log_at_trx_commit  = 0
+# Deliberate, and safe *because of* Galera: durability comes from synchronous
+# replication to two other nodes, not from the local disk. A committed
+# transaction exists on three machines before the client is acknowledged
+# (RPO = 0, CDC §N2). Paying an fsync per commit on top would halve throughput
+# for a guarantee the cluster already provides.
+# On a SINGLE-node deployment (`make single`) this becomes a real risk; the
+# single-node override raises it to 1.
+sync_binlog                     = 0
+# Same reasoning.
+
+# --- Sizing (profile `full`: 6 GB per node) ----------------------------------
+innodb_buffer_pool_size         = 512M
+innodb_log_file_size            = 256M
+innodb_flush_method             = O_DIRECT
+# Avoids double caching (InnoDB buffer pool + page cache), which matters on a
+# 6 GB node also running Cassandra and Elasticsearch.
+max_connections                 = 300
+# GLPI ×2 + Grafana ×2 + exporter + backup jobs, with headroom for a
+# connection storm during a failover.
+thread_cache_size               = 32
+table_open_cache                = 2000
+
+# --- Character set ------------------------------------------------------------
+character_set_server            = utf8mb4
+collation_server                = utf8mb4_unicode_ci
+# utf8mb4 and not utf8: GLPI ticket titles contain emoji and the full range of
+# accented characters. MariaDB's `utf8` is a 3-byte subset that truncates them.
+
+# --- Networking ---------------------------------------------------------------
+bind_address                    = 0.0.0.0
+# Bound inside the `data` overlay only: that network is `internal` (no gateway)
+# and IPsec-encrypted, and no port is published on any host.
+skip_name_resolve                = ON
+# Never do a reverse DNS lookup on connect: it adds latency and makes the
+# grants depend on DNS. Grants are written against '%' accordingly.
+
+# --- Logging ------------------------------------------------------------------
+log_error                       = /var/log/mysql/error.log
+slow_query_log                  = ON
+slow_query_log_file             = /var/log/mysql/slow.log
+long_query_time                 = 2
+# 2 s matches the GLPISlow alert threshold: a slow page and a slow query are
+# then correlatable in the same time window.
+log_warnings                    = 2
+
+# --- Health check surface -----------------------------------------------------
+# HAProxy uses `option mysql-check user haproxy`, which performs a login
+# handshake and disconnects. Those produce "Aborted connection" warnings by
+# design; keeping log_warnings at 2 documents them rather than hiding them.
+
+[embedded]
+[mariadb]
+[mariadb-11.4]

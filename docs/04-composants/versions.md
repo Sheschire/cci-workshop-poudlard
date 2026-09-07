@@ -89,7 +89,7 @@ le télécharge au démarrage depuis GitHub selon la version déclarée dans
 | blackbox-exporter | `prom/blackbox-exporter` | `v0.28.0` | `sha256:e753ff9f3fc458d02cca5eddab5a77e1c175eee484a8925ac7d524f04366c2fc` |
 
 Cassandra n'a pas d'exporter séparé : l'agent **JMX Prometheus** est embarqué dans l'image
-maison (voir ci-dessous). Le **JMX exporter javaagent** est figé à la version **1.4.0**
+maison (voir ci-dessous). Le **JMX exporter javaagent** est figé à la version **1.0.1**
 (`io.prometheus.jmx:jmx_prometheus_javaagent`), téléchargé depuis Maven Central au build.
 
 ## Sauvegardes — `stacks/backup.yml`

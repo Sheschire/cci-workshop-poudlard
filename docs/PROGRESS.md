@@ -83,17 +83,20 @@ critères dynamiques listés en bas de page.
 **Livrables** : `stacks/data.yml`, `config/{galera,haproxy,cassandra,elasticsearch,kibana,fluent-bit}/`,
 `images/cassandra/`, scripts d'initialisation
 
-| # | Critère d'acceptation | État |
-|---|---|---|
-| 2.1 | `wsrep_cluster_size = 3` sur les trois nœuds Galera | ⬜ |
-| 2.2 | `nodetool status` : 3 nœuds `UN` ; keyspace `datalake` avec RF=3 | ⬜ |
-| 2.3 | `_cluster/health` = `green` | ⬜ |
-| 2.4 | Politiques ILM, SLM et index templates en place | ⬜ |
-| 2.5 | Logs Traefik et logs de conteneurs visibles dans Kibana | ⬜ |
-| 2.6 | HAProxy `db-proxy` : un seul writer actif, bascule automatique | ⬜ |
-| 2.7 | Documentation : `galera.md`, `cassandra.md`, `elasticsearch.md`, `kibana.md`, `fluent-bit.md` | ⬜ |
+| # | Critère d'acceptation | État | Preuve |
+|---|---|---|---|
+| 2.1 | `wsrep_cluster_size = 3` | 🖥️ | stack validée ; `galera-bootstrap.sh` implémente la séquence complète, **flag de bootstrap retiré en étape 5** |
+| 2.2 | `nodetool status` 3 `UN` ; keyspace `datalake` RF=3 | 🖥️ | `init.cql` et `cassandra-init.sh` écrits ; la vérification finale du script fait un **aller-retour écriture/lecture réel en LOCAL_QUORUM** |
+| 2.3 | `_cluster/health` = `green` | 🖥️ | `es-init.sh` attend et distingue `yellow` transitoire (0 shard non assigné) de `yellow` anormal |
+| 2.4 | ILM, SLM et index templates en place | ✅ (statique) | 2 politiques ILM + 1 component template + 4 index templates + SLM : **JSON validés** ; `es-init.sh` vérifie en plus que l'ILM est réellement **attachée** à l'index sous-jacent |
+| 2.5 | Logs Traefik et conteneurs visibles dans Kibana | 🖥️ | chaîne complète écrite ; filtres Lua **exécutés et vérifiés hors conteneur** (7 cas, voir `fluent-bit.md` §5.3) |
+| 2.6 | `db-proxy` : un seul writer, bascule automatique | 🖥️ | `haproxy.cfg` : `galera-1` actif, 2 et 3 en `backup` dans un ordre déterministe, `on-marked-down shutdown-sessions` |
+| 2.7 | Documentation des 5 composants | ✅ | `galera.md`, `cassandra.md`, `elasticsearch.md`, `kibana.md`, `fluent-bit.md` |
+| 2.8 | Rendu de configuration Galera sûr | ✅ | wrapper **testé** : rendu exact de mots de passe contenant `/ & \ $`, et **4 cas négatifs** (secret absent, vide, illisible, variable manquante) abortent avant tout rendu |
+| 2.9 | Durcissement CDC §6.4 sur les 12 services | ✅ | contrôle automatisé : aucun service sans `no-new-privileges`, `cap_drop: [ALL]`, healthcheck, limites, `logging` |
 
-**Statut de la phase** : ⬜ à faire
+**Statut de la phase** : ✅ **terminée** — livrables complets, critères statiques vérifiés,
+critères dynamiques listés en bas de page.
 
 ---
 
@@ -267,6 +270,55 @@ curl -s http://192.168.56.13:5000/v2/_catalog
 # 1.8 — durcissement effectif dans les conteneurs
 vagrant ssh node1 -c "docker inspect \$(docker ps -q -f name=edge_traefik) \
   --format '{{.HostConfig.SecurityOpt}} {{.HostConfig.CapDrop}} {{.HostConfig.CapAdd}} {{.HostConfig.ReadonlyRootfs}}'"
+```
+
+### Phase 2
+
+```bash
+make build            # image dockerwarts/cassandra (agent JMX embarqué)
+make deploy-data      # déclenche galera-bootstrap.sh puis cassandra-init.sh et es-init.sh
+
+# 2.1 — Galera
+vagrant ssh node1 -c "docker exec \$(docker ps -q -f name=data_galera-1) \
+  mariadb -u root -p\"\$(cat /run/secrets/dw_mariadb_root_password)\" -e \
+  \"SHOW STATUS WHERE Variable_name IN
+     ('wsrep_cluster_size','wsrep_cluster_status','wsrep_local_state_comment')\""
+#   attendu : 3 / Primary / Synced
+#   ET vérifier que le flag de bootstrap a bien été retiré :
+vagrant ssh node1 -c "docker service inspect data_galera-1 \
+  --format '{{range .Spec.TaskTemplate.ContainerSpec.Env}}{{println .}}{{end}}' | grep GALERA_BOOTSTRAP"
+#   attendu : GALERA_BOOTSTRAP=0
+
+# 2.2 — Cassandra
+vagrant ssh node1 -c "docker exec \$(docker ps -q -f name=data_cassandra-1) nodetool status"
+#   attendu : 3 lignes UN
+vagrant ssh node1 -c "docker exec \$(docker ps -q -f name=data_cassandra-1) \
+  cqlsh -u dwadmin -p '<dw_cassandra_admin_password>' -e \
+  \"SELECT keyspace_name, replication FROM system_schema.keyspaces
+     WHERE keyspace_name IN ('datalake','system_auth');\""
+#   attendu : {'class': 'NetworkTopologyStrategy', 'dc1': '3'} pour LES DEUX
+
+# 2.3 / 2.4 — Elasticsearch
+vagrant ssh node1 -c "docker exec \$(docker ps -q -f name=data_es-1) sh -c \
+  'curl -s -u elastic:\$(cat /run/secrets/dw_es_elastic_password) \
+     localhost:9200/_cluster/health?pretty'"
+#   attendu : status green, number_of_nodes 3, unassigned_shards 0
+vagrant ssh node1 -c "docker exec \$(docker ps -q -f name=data_es-1) sh -c \
+  'curl -s -u elastic:\$(cat /run/secrets/dw_es_elastic_password) localhost:9200/_cat/indices'"
+
+# 2.5 — logs de bout en bout
+#   ouvrir https://kibana.dockerwarts.lan → Discover → data view `logs-*`
+#   vérifier la présence des champs service_name, stack, node_name, log_level
+#   puis filtrer sur `logs-traefik` et confirmer ClientHost / DownstreamStatus
+
+# 2.6 — writer unique
+vagrant ssh node1 -c "docker exec \$(docker ps -q -f name=data_db-proxy) \
+  sh -c 'wget -qO- http://127.0.0.1:8404/stats;csv' | grep '^mariadb,'"
+#   attendu : galera-1 UP et non backup ; galera-2 et galera-3 UP mais backup
+#   test de bascule :
+vagrant ssh node1 -c 'docker service scale data_galera-1=0'
+#   → galera-2 doit devenir le writer en moins de 5 s ; GLPI reste disponible
+vagrant ssh node1 -c 'docker service scale data_galera-1=1'
 ```
 
 > **À confirmer au premier démarrage** : `read_only: true` sur `traefik` et

@@ -1,0 +1,155 @@
+# =============================================================================
+# Cassandra — Prometheus JMX exporter configuration.
+#
+# Mounted read-only at /etc/cassandra/jmx-exporter.yml on cassandra-1/2/3, and
+# handed to the javaagent through JVM_OPTS (see stacks/data.yml).
+#
+# Why an explicit allow-list rather than "export everything"
+# ---------------------------------------------------------
+# Cassandra publishes tens of thousands of MBeans — one set per table, per
+# keyspace, per thread pool. Exporting them all produces a /metrics payload of
+# several megabytes, a scrape that takes seconds, and a Prometheus TSDB
+# dominated by series nobody looks at. Worse, the JMX scrape itself becomes a
+# measurable load on the database.
+#
+# So this file whitelists exactly the metrics the dashboards and the alerting
+# rules of CDC §7.3 need, and drops the rest.
+#
+# Documented in docs/04-composants/cassandra.md.
+# =============================================================================
+---
+# Scrape the JVM of this process only; no remote JMX connection, no credentials
+# on the wire. That is the whole point of the in-JVM agent.
+startDelaySeconds: 0
+lowercaseOutputName: true
+lowercaseOutputLabelNames: true
+
+# --- Blacklist first: the expensive, low-value MBeans ------------------------
+# Per-table histograms multiply by the number of tables; the aggregated,
+# keyspace-level equivalents are kept below and are what the dashboards use.
+blacklistObjectNames:
+  - "org.apache.cassandra.metrics:type=ColumnFamily,*"
+  - "org.apache.cassandra.metrics:type=Table,keyspace=system*,*"
+  - "org.apache.cassandra.metrics:type=Table,scope=*,name=EstimatedPartitionSizeHistogram,*"
+  - "org.apache.cassandra.metrics:type=Table,scope=*,name=EstimatedColumnCountHistogram,*"
+  - "org.apache.cassandra.metrics:type=Table,scope=*,name=SnapshotsSize,*"
+  - "org.apache.cassandra.internal:*"
+
+rules:
+  # ===========================================================================
+  # 1. Cluster membership and gossip
+  #    Feeds the `CassandraNodeDown` alert and the "nodes UN/DN" panel.
+  # ===========================================================================
+  - pattern: 'org\.apache\.cassandra\.net<type=FailureDetector><>(DownEndpointCount|UpEndpointCount)'
+    name: cassandra_endpoint_$1
+    type: GAUGE
+    help: "Number of endpoints seen as up/down by the failure detector"
+
+  # ===========================================================================
+  # 2. Client request latency and errors — the user-visible signal
+  #    `Read` and `Write` scopes only; the CAS and Range variants are not used
+  #    by this platform's data model.
+  # ===========================================================================
+  - pattern: 'org\.apache\.cassandra\.metrics<type=ClientRequest, scope=(Read|Write), name=Latency><>(Count|OneMinuteRate|Mean|99thPercentile|95thPercentile)'
+    name: cassandra_client_request_latency_$2
+    type: GAUGE
+    labels:
+      operation: "$1"
+    help: "Client request latency ($1)"
+
+  - pattern: 'org\.apache\.cassandra\.metrics<type=ClientRequest, scope=(Read|Write), name=(Timeouts|Unavailables|Failures)><>Count'
+    name: cassandra_client_request_$2_total
+    type: COUNTER
+    labels:
+      operation: "$1"
+    help: "Client request $2 ($1) — non-zero means the consistency level could not be met"
+
+  # ===========================================================================
+  # 3. Compaction — feeds `CassandraPendingCompactions`
+  #    A rising backlog means the node cannot keep up with writes; left alone
+  #    it ends in read amplification and then disk exhaustion.
+  # ===========================================================================
+  - pattern: 'org\.apache\.cassandra\.metrics<type=Compaction, name=(PendingTasks|CompletedTasks)><>(Value|Count)'
+    name: cassandra_compaction_$1
+    type: GAUGE
+    help: "Compaction $1"
+
+  # ===========================================================================
+  # 4. Storage — feeds `CassandraDiskUsage`
+  # ===========================================================================
+  - pattern: 'org\.apache\.cassandra\.metrics<type=Storage, name=(Load|TotalHints|TotalHintsInProgress)><>Count'
+    name: cassandra_storage_$1
+    type: GAUGE
+    help: "Storage $1 (Load = bytes on disk; hints = writes buffered for an absent node)"
+
+  # `TotalHints` deserves the emphasis: a growing hint count is the earliest
+  # signal that a peer is unreachable and that a `nodetool repair` will be
+  # needed once it returns.
+
+  # ===========================================================================
+  # 5. Thread pools — where saturation shows up first
+  # ===========================================================================
+  - pattern: 'org\.apache\.cassandra\.metrics<type=ThreadPools, path=(\w+), scope=(\w+), name=(PendingTasks|ActiveTasks|CurrentlyBlockedTasks)><>(Value|Count)'
+    name: cassandra_threadpool_$3
+    type: GAUGE
+    labels:
+      path: "$1"
+      pool: "$2"
+    help: "Thread pool $3"
+
+  # ===========================================================================
+  # 6. Keyspace-level table metrics — aggregated, so the cardinality stays flat
+  # ===========================================================================
+  - pattern: 'org\.apache\.cassandra\.metrics<type=Keyspace, keyspace=(\w+), name=(ReadLatency|WriteLatency)><>(Count|99thPercentile|Mean)'
+    name: cassandra_keyspace_$2_$3
+    type: GAUGE
+    labels:
+      keyspace: "$1"
+    help: "Keyspace-level $2"
+
+  - pattern: 'org\.apache\.cassandra\.metrics<type=Keyspace, keyspace=(\w+), name=(LiveDiskSpaceUsed|TotalDiskSpaceUsed|PendingCompactions)><>(Count|Value)'
+    name: cassandra_keyspace_$2
+    type: GAUGE
+    labels:
+      keyspace: "$1"
+    help: "Keyspace-level $2"
+
+  # ===========================================================================
+  # 7. Dropped messages — a direct symptom of overload
+  # ===========================================================================
+  - pattern: 'org\.apache\.cassandra\.metrics<type=DroppedMessage, scope=(\w+), name=Dropped><>Count'
+    name: cassandra_dropped_messages_total
+    type: COUNTER
+    labels:
+      message_type: "$1"
+    help: "Messages dropped because the node could not process them in time"
+
+  # ===========================================================================
+  # 8. JVM — heap and garbage collection
+  #    Cassandra performance problems are very often GC problems.
+  # ===========================================================================
+  - pattern: 'java\.lang<type=Memory><(HeapMemoryUsage|NonHeapMemoryUsage)>(used|max|committed)'
+    name: cassandra_jvm_memory_$1_$2_bytes
+    type: GAUGE
+    help: "JVM $1 $2"
+
+  - pattern: 'java\.lang<type=GarbageCollector, name=(.+)><>(CollectionCount|CollectionTime)'
+    name: cassandra_jvm_gc_$2
+    type: COUNTER
+    labels:
+      collector: "$1"
+    help: "Garbage collector $2 (time is cumulative milliseconds)"
+
+  - pattern: 'java\.lang<type=Threading><>ThreadCount'
+    name: cassandra_jvm_threads
+    type: GAUGE
+
+  # ===========================================================================
+  # 9. Catch-all: DROP.
+  #
+  # An empty `name` with no `type` discards the metric. This must stay LAST —
+  # the rules are evaluated in order and the first match wins. Without it, the
+  # exporter would fall back to its default behaviour and publish every
+  # remaining MBean, which is exactly what this file exists to prevent.
+  # ===========================================================================
+  - pattern: ".*"

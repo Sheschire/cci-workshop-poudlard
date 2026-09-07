@@ -1,0 +1,25 @@
+# =============================================================================
+# Images allowed to be pinned by TAG ONLY (no digest).
+#
+# CDC §6.4 requires every public image to carry a tag AND a digest.
+# scripts/validate-stacks.sh enforces that. This file is the explicit,
+# reviewable list of exceptions — one line per image reference, with the reason
+# in a comment directly above it. An entry here is a debt to be repaid, not a
+# permanent dispensation.
+#
+# Empty lines and lines starting with # are ignored.
+# =============================================================================
+
+# The Elastic registry (docker.elastic.co) is refused by the egress policy of
+# the environment in which this repository was developed: `HEAD /v2/…/manifests`
+# returns 403, so the manifest digest could not be read. The version itself is
+# confirmed (8.19.21 is the last patch of the 8.19 minor, cross-checked on the
+# Docker Hub mirror).
+#
+# TO CLOSE THIS EXCEPTION, from a cluster node with full Internet access:
+#   docker buildx imagetools inspect docker.elastic.co/elasticsearch/elasticsearch:8.19.21
+#   docker buildx imagetools inspect docker.elastic.co/kibana/kibana:8.19.21
+#   scripts/pin-digests.sh --write     # then review the diff and remove the
+#                                      # two lines below
+docker.elastic.co/elasticsearch/elasticsearch:8.19.21
+docker.elastic.co/kibana/kibana:8.19.21

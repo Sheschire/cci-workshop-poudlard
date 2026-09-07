@@ -46,6 +46,7 @@ TRAEFIK_STATIC     config/traefik/traefik.yml
 TRAEFIK_DYNAMIC    .rendered/traefik-dynamic.yml
 CROWDSEC_ACQUIS    config/crowdsec/acquis.yaml
 CROWDSEC_PROFILES  config/crowdsec/profiles.yaml
+GALERA_ENTRYPOINT  config/galera/entrypoint.sh
 GALERA_CNF         config/galera/galera.cnf
 GALERA_INIT        config/galera/init.sql
 HAPROXY            .rendered/haproxy.cfg
@@ -64,6 +65,7 @@ GRAFANA_PROV       config/grafana/provisioning
 GRAFANA_DASH       config/grafana/dashboards
 NGINX_METRICS      config/backup/nginx.conf
 MINIO_POLICIES     config/minio/policies
+SECRETS_ENTRYPOINT config/common/secrets-entrypoint.sh
 EOF
 }
 

@@ -1,0 +1,39 @@
+{
+  "_comment": [
+    "Index template for `logs-traefik`: the JSON access log.",
+    "",
+    "These fields are typed explicitly because they are what the Traefik and",
+    "Sécurité dashboards aggregate on. `ClientHost` as a keyword (not text) is",
+    "what makes a terms aggregation over source IPs possible at all."
+  ],
+  "index_patterns": ["logs-traefik*"],
+  "data_stream": {},
+  "priority": 200,
+  "composed_of": ["dockerwarts-logs-common"],
+  "template": {
+    "mappings": {
+      "properties": {
+        "ClientHost":       { "type": "ip" },
+        "ClientAddr":       { "type": "keyword" },
+        "RequestMethod":    { "type": "keyword" },
+        "RequestPath":      { "type": "keyword", "ignore_above": 2048 },
+        "RequestHost":      { "type": "keyword" },
+        "RequestProtocol":  { "type": "keyword" },
+        "DownstreamStatus": { "type": "short" },
+        "Duration":         { "type": "long" },
+        "RouterName":       { "type": "keyword" },
+        "ServiceName":      { "type": "keyword" },
+        "RetryAttempts":    { "type": "short" },
+        "request_User-Agent": { "type": "keyword", "ignore_above": 512 },
+        "request_Referer":  { "type": "keyword", "ignore_above": 1024 },
+        "TLSVersion":       { "type": "keyword" },
+        "TLSCipher":        { "type": "keyword" }
+      }
+    }
+  },
+  "_meta": {
+    "ClientHost": "Typed as `ip`, not keyword: that enables CIDR range queries during an incident (`ClientHost: \"203.0.113.0/24\"`), which a keyword cannot do.",
+    "Duration": "Nanoseconds, as Traefik emits them. Grafana converts for display; storing the raw value avoids a lossy conversion at ingestion.",
+    "managed_by": "scripts/es-init.sh"
+  }
+}

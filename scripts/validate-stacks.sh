@@ -56,14 +56,22 @@ for stack in "${STACK_FILES[@]}"; do
   ok "${stack} parses"
 
   # --- Convention checks on the rendered file --------------------------------
-  # 1. Pinning. Home-made images live in the internal registry and are pinned
-  #    by an immutable tag built by `make build`, not by digest (the digest is
-  #    only known after the push) — they are exempt.
+  # 1. Pinning. Two exemptions, both narrow and explicit:
+  #    - home-made images live in the internal registry and are pinned by an
+  #      immutable tag built by `make build` (the digest only exists after the
+  #      push, and the registry already guarantees the three nodes pull the
+  #      same content for a given tag);
+  #    - references listed in config/unpinned-images.txt, each with a written
+  #      justification and the command that closes the exception.
   while IFS= read -r image; do
     [[ "$image" == *"${REGISTRY}"* ]] && continue
     if [[ "$image" != *"@sha256:"* ]]; then
-      error "${name}: image not pinned by digest: ${image}"
-      rc=1
+      if grep -qxF "$image" "${DW_ROOT}/config/unpinned-images.txt" 2>/dev/null; then
+        warn "${name}: ${image} pinned by tag only (documented exception, see config/unpinned-images.txt)"
+      else
+        error "${name}: image not pinned by digest: ${image}"
+        rc=1
+      fi
     fi
     if [[ "$image" != *:* || "$image" =~ ^[^:]+@sha256 ]]; then
       error "${name}: image pinned by digest but missing a readable tag: ${image}"
