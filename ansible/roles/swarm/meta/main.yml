@@ -1,6 +1,0 @@
----
-# Role swarm — Dockerwarts N°1.
-# No galaxy_info block: the role names follow the CDC directory naming
-# (hyphenated), which Galaxy's schema forbids, and none of these roles is
-# published to Galaxy.
-dependencies: []

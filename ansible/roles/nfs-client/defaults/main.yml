@@ -1,4 +1,0 @@
----
-# IP of the host in the `nfs_server` group. Overridden by the playbook so that
-# moving the group is the only change needed for an NFS failover (ADR-0006).
-nfs_client_server_ip: "{{ hostvars[groups['nfs_server'][0]].cluster_ip }}"

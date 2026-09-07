@@ -1,42 +1,34 @@
----
 # =============================================================================
-# Traefik v3 — dynamic configuration (file provider, watched, no restart).
+# Traefik — configuration dynamique (fournisseur « file »)
 #
-# Holds what must not depend on a service being up: the TLS material, the TLS
-# options, the middleware catalogue, and the routers for Traefik's own
-# dashboard.
+# Ce fichier ne contient QUE ce qui ne dépend d'aucune variable : le certificat
+# et les réglages TLS. Tout le reste — routeurs, middlewares, chaînes — est
+# déclaré par des labels dans docker-compose.yml, parce que le fournisseur
+# « file » de Traefik ne remplace pas les variables d'environnement, alors que
+# Compose le fait.
 #
-# Application routers live in the service labels of the stacks — a service
-# declares how it wants to be exposed, next to its own definition.
-#
-# Deployed as a Swarm `config`, mounted read-only at /etc/traefik/dynamic.yml.
-# Documented section by section in docs/04-composants/traefik.md.
+# Traefik relit ce fichier à chaud : le modifier ne demande aucun redémarrage.
 # =============================================================================
 
 tls:
-  # --- Certificates ----------------------------------------------------------
-  # Wildcard `*.dockerwarts.lan` issued by the internal CA (scripts/gen-certs.sh)
-  # and mounted from Docker secrets. `stores.default` makes it the certificate
-  # served for any SNI, so a new sub-domain needs no TLS change at all.
-  certificates:
-    - certFile: /run/secrets/dw_tls_cert
-      keyFile: /run/secrets/dw_tls_key
-      stores:
-        - default
+  # Certificat présenté par défaut pour tous les noms d'hôte. Il est produit
+  # par scripts/init.sh et auto-signé : le navigateur affichera un
+  # avertissement, ce qui est normal en local. En production, on remplace ce
+  # bloc par un resolver ACME (Let's Encrypt) — voir docs/03-securite.md.
   stores:
     default:
       defaultCertificate:
-        certFile: /run/secrets/dw_tls_cert
-        keyFile: /run/secrets/dw_tls_key
+        certFile: /etc/traefik/certs/dockerwarts.crt
+        keyFile: /etc/traefik/certs/dockerwarts.key
 
-  # --- TLS options -----------------------------------------------------------
   options:
-    # Applied to every router through the `websecure` entrypoint (traefik.yml).
-    modern:
+    default:
+      # TLS 1.2 au minimum : SSLv3, TLS 1.0 et 1.1 sont cassés et refusés par
+      # les navigateurs récents de toute façon.
       minVersion: VersionTLS12
-      maxVersion: VersionTLS13
-      # TLS 1.3 negotiates its own suites; this list only constrains TLS 1.2.
-      # AEAD only (GCM / ChaCha20), forward secrecy only (ECDHE).
+      # Suites retenues pour TLS 1.2 : uniquement de l'AEAD avec échange de
+      # clés éphémère (confidentialité persistante). TLS 1.3 choisit seul ses
+      # suites, cette liste ne le concerne pas.
       cipherSuites:
         - TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
         - TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
@@ -45,170 +37,6 @@ tls:
         - TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305
         - TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305
       curvePreferences:
-        - X25519
         - CurveP256
-      # The client picks: with only AEAD suites on offer, letting the client
-      # choose its fastest one (ChaCha20 on mobile, AES-NI on desktop) is the
-      # current recommendation.
-      preferServerCipherSuites: false
-      sniStrict: false   # allow https://192.168.56.10/ with no SNI
-
-http:
-  # ===========================================================================
-  # Middlewares — layer 2 of the four-layer firewall (CDC §6.2, ADR-0004)
-  # ===========================================================================
-  middlewares:
-
-    # --- Security headers, applied to every route ---------------------------
-    security-headers:
-      headers:
-        # HSTS: 1 year, subdomains included. Only meaningful because port 80
-        # permanently redirects to 443.
-        stsSeconds: 31536000
-        stsIncludeSubdomains: true
-        stsPreload: false            # never preload a non-public domain
-        forceSTSHeader: true
-        # Anti-MIME-sniffing.
-        contentTypeNosniff: true
-        # SAMEORIGIN, not DENY: GLPI and Grafana both use same-origin iframes.
-        frameDeny: false
-        customResponseHeaders:
-          X-Frame-Options: "SAMEORIGIN"
-          # Hide the server banner: free reconnaissance otherwise.
-          Server: ""
-          X-Powered-By: ""
-        referrerPolicy: "strict-origin-when-cross-origin"
-        permissionsPolicy: "camera=(), microphone=(), geolocation=(), payment=()"
-        browserXssFilter: false      # obsolete and harmful; CSP is the answer
-        # X-Forwarded-Proto=https lets GLPI and Grafana build correct absolute
-        # URLs even though they are reached over plain HTTP inside the overlay.
-        customRequestHeaders:
-          X-Forwarded-Proto: "https"
-
-    # --- Rate limiting (CDC §6.2) -------------------------------------------
-    # 100 req/s average, burst 50, per source IP. Sized to be invisible to a
-    # human loading a GLPI page (~40 assets) while cutting a scanner down.
-    # `depth: 0` + `excludedIPs: []` → the source is the real TCP peer, which
-    # is correct because Traefik listens in host mode (ADR-0003).
-    rate-limit:
-      rateLimit:
-        average: 100
-        burst: 50
-        period: 1s
-        sourceCriterion:
-          ipStrategy:
-            depth: 0
-
-    # Stricter variant for the login endpoints: brute force is a slow, steady
-    # stream, so the average matters more than the burst.
-    rate-limit-login:
-      rateLimit:
-        average: 5
-        burst: 10
-        period: 1s
-        sourceCriterion:
-          ipStrategy:
-            depth: 0
-
-    # --- Administration allowlist -------------------------------------------
-    # Prometheus, Alertmanager, Kibana, the Traefik dashboard, the MinIO console
-    # and whoami are only reachable from the administration network.
-    # The two ranges below are substituted from .env by scripts/lib/render.py
-    # before the Swarm config object is created. render.py refuses to leave
-    # either of them empty: an empty allowlist would open these UIs to all.
-    admin-allowlist:
-      ipAllowList:
-        sourceRange:
-          - "${ADMIN_CIDR}"
-          - "${CLUSTER_CIDR}"
-        ipStrategy:
-          depth: 0
-
-    # --- Basic authentication ------------------------------------------------
-    # Second factor on top of the allowlist for the raw admin UIs (Prometheus,
-    # Alertmanager, Traefik dashboard) — those have no authentication of their
-    # own. Grafana, Kibana and GLPI authenticate their users themselves.
-    basic-auth:
-      basicAuth:
-        usersFile: /run/secrets/dw_traefik_htpasswd
-        realm: "Dockerwarts administration"
-        removeHeader: true          # never forward Authorization upstream
-
-    # --- CrowdSec bouncer (layer 3, ADR-0004) --------------------------------
-    # `stream` mode: the plugin keeps a local copy of the decision list,
-    # refreshed every 60 s. A ban therefore applies in under a minute, and —
-    # crucially — protection SURVIVES a LAPI outage, which matters because the
-    # LAPI is a single replica being rescheduled during a node failure.
-    crowdsec:
-      plugin:
-        crowdsec:
-          enabled: true
-          logLevel: INFO
-          crowdsecMode: stream
-          crowdsecLapiScheme: http          # `crowdsec` overlay, internal
-          crowdsecLapiHost: crowdsec-lapi:8080
-          crowdsecLapiKeyFile: /run/secrets/dw_crowdsec_bouncer_key
-          updateIntervalSeconds: 60
-          defaultDecisionSeconds: 300
-          # Never ban the cluster itself or the operator: a false positive on
-          # these would take the whole platform down.
-          forwardedHeadersTrustedIPs: []
-          clientTrustedIPs:
-            - "${CLUSTER_CIDR}"
-          # Health probes and metrics must never be blocked.
-          crowdsecAppsecEnabled: false
-
-    # --- Composites ----------------------------------------------------------
-    # Named once, referenced by the stack labels: a route's protection is then
-    # a single, readable label instead of an ordered list to keep in sync.
-    admin-chain:
-      chain:
-        middlewares:
-          - admin-allowlist
-          - basic-auth
-          - rate-limit
-
-    admin-chain-noauth:
-      chain:
-        middlewares:
-          - admin-allowlist
-          - rate-limit
-
-    app-chain:
-      chain:
-        middlewares:
-          - rate-limit
-
-  # ===========================================================================
-  # Routers owned by Traefik itself
-  # ===========================================================================
-  routers:
-    # Dashboard and API — allowlist + basic-auth on top of TLS.
-    traefik-dashboard:
-      rule: "Host(`traefik.${DOMAIN}`)"
-      entryPoints: [websecure]
-      service: api@internal
-      middlewares:
-        - admin-chain@file
-      tls:
-        options: modern
-
-    # Explicit 404 for anything hitting the VIP without a known Host. Without
-    # it Traefik answers with its own 404 page, which leaks the fact that
-    # Traefik is there; this returns a bare, cacheable 404.
-    catch-all:
-      rule: "PathPrefix(`/`)"
-      entryPoints: [websecure]
-      priority: 1                   # lowest: every real router outranks it
-      service: noop@file
-      middlewares:
-        - security-headers@file
-      tls:
-        options: modern
-
-  services:
-    # A service that resolves to nothing: Traefik answers 502/404 without
-    # forwarding anywhere. Used by catch-all.
-    noop:
-      loadBalancer:
-        servers: []
+        - X25519
+      sniStrict: false

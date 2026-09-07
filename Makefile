@@ -1,233 +1,62 @@
 # =============================================================================
-# Dockerwarts N°1 — operator entry point.
+# Dockerwarts N°1 — raccourcis
 #
-# Nominal sequence on a fresh workstation (CDC §13, Definition of Done):
+#   make          affiche cette aide
+#   make init     prépare .env, le certificat et le compte d'administration
+#   make up       démarre la plateforme
+#   make verify   vérifie que tout répond réellement
 #
-#   cp .env.example .env
-#   make vms provision secrets certs build deploy smoke chaos dr-drill
-#
-# Everything below is a thin, documented wrapper around scripts/ and ansible/:
-# no logic lives in this file beyond ordering and guard rails.
+# Rien d'indispensable ici : chaque cible tient en une commande docker compose,
+# rappelée dans docs/02-installation.md.
 # =============================================================================
 
-# `command -v` is resolved by make at parse time: this picks up a modern bash
-# from PATH (Homebrew on macOS, /usr/bin on Linux) rather than the 3.2 that
-# ships with macOS. SHELL must be a plain path — `/usr/bin/env bash` is not one.
-SHELL := $(shell command -v bash)
-.SHELLFLAGS := -Eeuo pipefail -c
 .DEFAULT_GOAL := help
-.ONESHELL:
+.PHONY: help init up down restart logs ps verify backup restore firewall config clean
 
-ROOT      := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
-ENV_FILE  := $(ROOT)/.env
-ANSIBLE   := $(ROOT)/ansible
-STACKS    := $(ROOT)/stacks
-SCRIPTS   := $(ROOT)/scripts
-TESTS     := $(ROOT)/tests
-REPORTS   := $(ROOT)/reports
+help: ## Affiche cette aide
+	@printf '\nDockerwarts N°1 — cibles disponibles\n\n'
+	@grep -E '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) \
+	  | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
+	@printf '\n'
 
-# Stacks are deployed in dependency order: data must be healthy before apps,
-# which must exist before monitoring can scrape them.
-STACK_ORDER := edge data apps monitoring backup
+init: ## Prépare .env, le certificat TLS et le compte d'administration
+	@./scripts/init.sh
 
-# Home-made images (CDC §10.2), built by `make build` and pushed to $(REGISTRY).
-OWN_IMAGES := cassandra alert2glpi backup-runner demo-producer
+up: ## Démarre la plateforme
+	docker compose up -d
+	@printf '\n  Démarrage en cours. Suivi : make logs — vérification : make verify\n'
+	@printf '  GLPI met environ deux minutes à s'\''installer au premier lancement.\n\n'
 
-export DOCKER_CLI_HINTS := false
+down: ## Arrête la plateforme (les données sont conservées)
+	docker compose down
 
-# --- .env handling -----------------------------------------------------------
-# Most targets need the variables; a few (help, lint) must work without a .env
-# so that the CI can run them on a bare checkout.
-ifneq (,$(wildcard $(ENV_FILE)))
-include $(ENV_FILE)
-export
-endif
+restart: ## Redémarre tous les services
+	docker compose restart
 
-define require_env
-	@if [ ! -f "$(ENV_FILE)" ]; then \
-	  echo "ERROR: $(ENV_FILE) is missing. Run: cp .env.example .env"; exit 1; \
-	fi
-endef
+logs: ## Suit les journaux (make logs S=glpi pour un seul service)
+	docker compose logs -f --tail=100 $(S)
 
-# =============================================================================
-help: ## Show this help
-	@echo "Dockerwarts N°1 — available targets"
-	@echo
-	@grep -hE '^[a-zA-Z0-9_.-]+:.*?## .*$$' $(MAKEFILE_LIST) \
-	  | sort \
-	  | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-22s\033[0m %s\n", $$1, $$2}'
-	@echo
-	@echo "Nominal sequence: make vms provision secrets certs build deploy smoke"
+ps: ## Etat des conteneurs
+	docker compose ps
 
-# =============================================================================
-# Infrastructure
-# =============================================================================
-.PHONY: vms destroy provision provision-check hosts
+verify: ## Vérifie que chaque service répond réellement
+	@./scripts/verify.sh
 
-vms: ## Create the 3 Ubuntu 24.04 VMs (Vagrant + VirtualBox)
-	$(require_env)
-	@if [ ! -f "$(ANSIBLE)/inventory/hosts.yml" ]; then \
-	  cp "$(ANSIBLE)/inventory/hosts.yml.example" "$(ANSIBLE)/inventory/hosts.yml"; \
-	  echo "-> created ansible/inventory/hosts.yml from the example"; \
-	fi
-	cd $(ROOT) && NODE_MEM=$${NODE_MEM:-6144} NODE_CPU=$${NODE_CPU:-4} vagrant up
+backup: ## Sauvegarde complète dans backups/<horodatage>/
+	@./scripts/backup.sh
 
-destroy: ## Destroy the 3 VMs (irreversible)
-	cd $(ROOT) && vagrant destroy -f
+restore: ## Restaure une sauvegarde (make restore FROM=backups/2026-...)
+	@test -n "$(FROM)" || { echo "Usage : make restore FROM=backups/<horodatage>"; exit 1; }
+	@./scripts/restore.sh "$(FROM)"
 
-provision: ## Configure the hosts and the Swarm (Ansible)
-	$(require_env)
-	cd $(ANSIBLE) && ansible-playbook playbooks/site.yml
+firewall: ## Affiche les règles de pare-feu hôte (n'applique rien)
+	@./scripts/firewall.sh
 
-provision-check: ## Idempotency check — must report 0 changed (criterion 0.2)
-	cd $(ANSIBLE) && ansible-playbook playbooks/site.yml --check --diff
+config: ## Valide et affiche la configuration Compose résolue
+	docker compose config
 
-hosts: ## Print the /etc/hosts line to add on the workstation
-	@$(SCRIPTS)/hosts-entries.sh
-
-# =============================================================================
-# Secrets, certificates, images
-# =============================================================================
-.PHONY: secrets certs build pin-digests
-
-secrets: ## Generate secrets/ and create the missing Docker secrets
-	$(require_env)
-	$(SCRIPTS)/init-secrets.sh
-
-certs: ## Internal CA, wildcard certificate and Elasticsearch transport certs
-	$(require_env)
-	$(SCRIPTS)/gen-certs.sh
-	$(SCRIPTS)/gen-es-certs.sh
-
-build: ## Build the home-made images and push them to the internal registry
-	$(require_env)
-	$(SCRIPTS)/build-images.sh $(OWN_IMAGES)
-
-pin-digests: ## Check that the digests pinned in stacks/ still match their tags
-	$(SCRIPTS)/pin-digests.sh
-
-# =============================================================================
-# Deployment
-# =============================================================================
-.PHONY: deploy $(addprefix deploy-,$(STACK_ORDER)) deploy-registry deploy-demo status single
-
-deploy: ## Deploy every stack in order, waiting for health between them
-	$(require_env)
-	$(SCRIPTS)/deploy.sh all
-
-deploy-registry: ## Deploy the internal registry only
-	$(require_env)
-	$(SCRIPTS)/deploy.sh registry
-
-$(addprefix deploy-,$(STACK_ORDER)): deploy-%: ## Deploy a single stack
-	$(require_env)
-	$(SCRIPTS)/deploy.sh $*
-
-deploy-demo: ## Deploy the big-data demo producer (optional)
-	$(require_env)
-	$(SCRIPTS)/deploy.sh demo
-
-status: ## Services, nodes and cluster health at a glance
-	$(SCRIPTS)/status.sh
-
-single: single-prepare ## Single-node mode for a workstation (NOT highly available)
-	$(require_env)
-	$(SCRIPTS)/deploy.sh --single all
-
-single-prepare: ## Check that this workstation can run `make single` (--fix to repair)
-	$(SCRIPTS)/single-node-prepare.sh $(ARGS)
-
-# =============================================================================
-# Tests
-# =============================================================================
-.PHONY: smoke chaos dr-drill test-python single-prepare
-
-smoke: ## End-to-end validation through the VIP (ARGS="--quick --no-backup")
-	$(TESTS)/smoke/smoke.sh $(ARGS)
-
-chaos: ## HA test campaign (ARGS="--no-node-kill" from a node without Vagrant)
-	@mkdir -p $(REPORTS)
-	$(TESTS)/chaos/run-all.sh $(ARGS)
-
-dr-drill: ## Automated disaster-recovery drill (restores, no production impact)
-	@mkdir -p $(REPORTS)
-	$(TESTS)/dr/dr-drill.sh
-
-test-python: ## Unit tests of the home-made Python services
-	cd $(ROOT)/images/alert2glpi && python3 -m pytest -q
-	cd $(ROOT)/images/demo-producer && python3 -m pytest -q
-
-# =============================================================================
-# Backup and restore
-# =============================================================================
-.PHONY: backup-now restore-galera restore-glpi-files restore-cassandra restore-es
-.PHONY: restore-prometheus restore-crowdsec restore-all
-
-backup-now: ## Trigger every backup job immediately
-	$(SCRIPTS)/backup-now.sh
-
-restore-galera: ## Restore the SQL databases from the latest restic snapshot
-	$(SCRIPTS)/restore/restore-galera.sh $(ARGS)
-
-restore-glpi-files: ## Restore the GLPI NFS files
-	$(SCRIPTS)/restore/restore-glpi-files.sh $(ARGS)
-
-restore-cassandra: ## Restore the `datalake` keyspace (NODE=cassandra-1 …)
-	$(SCRIPTS)/restore/restore-cassandra.sh $(NODE) $(ARGS)
-
-restore-es: ## Restore Elasticsearch indices from a snapshot
-	$(SCRIPTS)/restore/restore-es.sh $(ARGS)
-
-restore-prometheus: ## Restore the Prometheus TSDB of instance A
-	$(SCRIPTS)/restore/restore-prometheus.sh $(ARGS)
-
-restore-crowdsec: ## Restore the CrowdSec LAPI database
-	$(SCRIPTS)/restore/restore-crowdsec.sh $(ARGS)
-
-restore-all: ## Full ordered restore of the platform
-	$(SCRIPTS)/restore/restore-all.sh $(ARGS)
-
-# =============================================================================
-# Quality
-# =============================================================================
-.PHONY: lint lint-yaml lint-ansible lint-shell lint-docker lint-python lint-prom lint-stacks
-
-lint: lint-yaml lint-ansible lint-shell lint-docker lint-python lint-prom lint-stacks lint-docs ## Run every linter
-
-lint-yaml: ## yamllint over the whole repository
-	yamllint -c $(ROOT)/.yamllint.yml $(ROOT)
-
-lint-ansible: ## ansible-lint (production profile)
-	cd $(ANSIBLE) && ansible-lint
-
-lint-shell: ## shellcheck over every shell script
-	# The firewall script is a Jinja template; shellcheck parses it because every
-	# substitution sits inside a quoted string or a comment.
-	find $(ROOT) -type f -name '*.sh' -not -path '*/.git/*' -print0 \
-	  | sort -z \
-	  | xargs -0 -r shellcheck --external-sources --source-path=$(ROOT)/scripts --shell=bash
-	shellcheck --external-sources --shell=bash \
-	  $(ANSIBLE)/roles/firewall/templates/dockerwarts-firewall.sh.j2
-
-lint-docker: ## hadolint over every Dockerfile
-	@find $(ROOT)/images -name Dockerfile -print0 | xargs -0 -r hadolint
-
-lint-python: ## ruff over the Python code (services + shared tooling)
-	ruff check $(ROOT)/images $(SCRIPTS)/lib
-	ruff format --check $(ROOT)/images $(SCRIPTS)/lib
-
-lint-prom: ## promtool / amtool checks (same script as the CI)
-	$(SCRIPTS)/validate-configs.sh
-
-lint-docs: ## Every file under config/ is documented, and no dangling reference
-	$(SCRIPTS)/check-docs-coverage.sh
-
-lint-stacks: ## Validate every stack with `docker stack config`
-	$(SCRIPTS)/validate-stacks.sh
-
-# =============================================================================
-.PHONY: clean
-clean: ## Remove local reports and generated artefacts (keeps secrets/ and certs/)
-	rm -rf $(REPORTS)
-	find $(ROOT) -name '__pycache__' -type d -prune -exec rm -rf {} +
-	find $(ROOT) -name '.pytest_cache' -type d -prune -exec rm -rf {} +
+clean: ## SUPPRIME tout, y compris les données. Irréversible.
+	@printf '\033[31m  Ceci supprime les volumes et donc toutes les données.\033[0m\n'
+	@read -r -p '  Taper « supprimer » pour confirmer : ' r; \
+	  [ "$$r" = "supprimer" ] || { echo "  Annulé."; exit 1; }
+	docker compose down -v

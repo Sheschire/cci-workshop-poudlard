@@ -1,347 +1,48 @@
----
 # =============================================================================
-# Prometheus 3 — scrape configuration (CDC §7.6).
+# Prometheus — collecte des métriques
 #
-# Rendered by scripts/lib/render.py (${DOMAIN}, ${VIP}) and mounted read-only
-# at /etc/prometheus/prometheus.yml on BOTH replicas.
+# Quatre sources suffisent à couvrir toute la plateforme :
+#   node-exporter  la machine      (CPU, RAM, disque, charge)
+#   cadvisor       les conteneurs  (CPU, RAM, redémarrages, par service)
+#   traefik        le trafic       (codes HTTP, latence, requêtes/s)
+#   prometheus     lui-même        (pour savoir quand LA collecte tombe)
 #
-# The HA model
-# ------------
-# Two Prometheus tasks run the IDENTICAL configuration and scrape the SAME
-# targets, each on its own local volume. There is no clustering and no shared
-# storage: that is the officially recommended pattern, and it is the simplest
-# thing that survives a node loss.
-#
-# The duplicate alerts it produces are deduplicated by Alertmanager, which
-# groups on the alert labels — not on which Prometheus sent them. So the
-# operator sees one alert, and alert2glpi opens one ticket, even though two
-# instances fired.
-#
-# The cost is that the two TSDBs drift slightly (different scrape offsets), so
-# a graph can differ by one sample between refreshes. That is accepted and
-# documented; the alternative (Thanos, Cortex) is a whole distributed system
-# for a 3-node lab.
-#
-# Documented section by section in docs/04-composants/prometheus.md.
+# Il n'y a pas d'Alertmanager : les règles de alerts.yml sont évaluées ici et
+# consultables dans l'onglet « Alerts » et dans Grafana. Choix assumé — voir
+# docs/04-haute-disponibilite.md.
 # =============================================================================
 
 global:
+  # 15 s : assez fin pour voir un incident se former, assez large pour que
+  # 30 jours de rétention tiennent sur quelques gigaoctets.
   scrape_interval: 15s
-  # 15 s: fine enough to catch a 30 s outage in the blackbox probes, coarse
-  # enough that ~60 targets cost little on three small VMs.
   evaluation_interval: 15s
-  scrape_timeout: 10s
-  # Strictly below scrape_interval, or a slow target would queue scrapes.
-
-  # Attached to every series this instance produces. `replica` is what lets
-  # Alertmanager tell the two instances apart when it deduplicates, and what a
-  # dashboard filters on to compare them.
   external_labels:
-    cluster: dockerwarts
-    replica: "${HOSTNAME}"
-
-# --- Alerting -----------------------------------------------------------------
-alerting:
-  alertmanagers:
-    - dns_sd_configs:
-        # `tasks.alertmanager` is Swarm's DNS name returning the A records of
-        # EVERY task of the service. Both Prometheus instances therefore send
-        # to all three Alertmanagers — which is what makes their gossip cluster
-        # able to deduplicate and to survive losing one of them.
-        # Using the plain `alertmanager` name would resolve to the service VIP
-        # and load-balance to ONE instance, defeating the whole design.
-        - names: ["tasks.alertmanager"]
-          type: A
-          port: 9093
-      timeout: 10s
+    infra: dockerwarts
 
 rule_files:
-  - /etc/prometheus/rules/*.yml
+  - /etc/prometheus/alerts.yml
 
-# =============================================================================
-# Scrape configurations
-# =============================================================================
 scrape_configs:
 
-  # ---------------------------------------------------------------------------
-  # 1. Prometheus itself
-  # ---------------------------------------------------------------------------
   - job_name: prometheus
     static_configs:
       - targets: ["localhost:9090"]
 
-  # ---------------------------------------------------------------------------
-  # 2. Swarm SERVICE discovery — the generic mechanism
-  #
-  # Every service that exposes metrics declares three labels (CDC §7.6):
-  #   prometheus.job   the job name
-  #   prometheus.port  the port to scrape
-  #   prometheus.path  optional, defaults to /metrics
-  #
-  # A new exporter therefore needs NO change here: adding the labels to its
-  # service is enough. That is the whole point of the convention.
-  # ---------------------------------------------------------------------------
-  - job_name: swarm-tasks
-    dockerswarm_sd_configs:
-      # Through the read-only socket proxy, never the raw socket (CDC §6.4).
-      - host: tcp://docker-socket-proxy:2375
-        role: tasks
-        port: 9999          # overridden by the relabel rules below
-        refresh_interval: 30s
-    relabel_configs:
-      # Keep only tasks whose service carries `prometheus.job`. Without this
-      # first rule, Prometheus would try to scrape every container in the
-      # cluster on a port it invented.
-      - source_labels: [__meta_dockerswarm_service_label_prometheus_job]
-        regex: .+
-        action: keep
-
-      # Only tasks that are actually running: a task in `shutdown` or
-      # `rejected` state has no listening port and would produce a permanent
-      # `up == 0`, which would fire PrometheusTargetMissing forever.
-      - source_labels: [__meta_dockerswarm_task_desired_state]
-        regex: running
-        action: keep
-
-      # job = the declared label.
-      - source_labels: [__meta_dockerswarm_service_label_prometheus_job]
-        target_label: job
-
-      # address = the task's own overlay IP + the declared port. The task IP
-      # and not the service VIP: scraping the VIP would land on a random
-      # replica each time and make per-instance graphs meaningless.
-      - source_labels: [__meta_dockerswarm_task_address, __meta_dockerswarm_service_label_prometheus_port]
-        regex: "([^:]+)(?::\\d+)?;(\\d+)"
-        replacement: "$1:$2"
-        target_label: __address__
-
-      # Optional metrics path (Fluent Bit uses /api/v1/metrics/prometheus).
-      - source_labels: [__meta_dockerswarm_service_label_prometheus_path]
-        regex: (.+)
-        target_label: __metrics_path__
-
-      # --- Identity labels ---------------------------------------------------
-      # `instance` is the TASK name (e.g. data_galera-1.1.abc), so two replicas
-      # of the same service are distinguishable on a graph.
-      - source_labels: [__meta_dockerswarm_task_name]
-        target_label: instance
-      # `node` is the Swarm hostname: this is what the NodeDown inhibition
-      # rule joins on to silence every alert of a dead node.
-      - source_labels: [__meta_dockerswarm_node_hostname]
-        target_label: node
-      - source_labels: [__meta_dockerswarm_service_name]
-        target_label: service
-      - source_labels: [__meta_dockerswarm_service_label_com_docker_stack_namespace]
-        target_label: stack
-
-  # ---------------------------------------------------------------------------
-  # 3. Swarm NODE discovery — node-exporter and cAdvisor
-  #
-  # A separate job from the one above because these are global services whose
-  # metrics describe the HOST, not the container: the `instance` label must be
-  # the node, not a task id, or every node reboot would look like a new machine
-  # and break every historical graph.
-  # ---------------------------------------------------------------------------
+  # Métriques de l'hôte. `pid: host` dans docker-compose.yml lui donne la vraie
+  # vue de la machine et non celle de son propre espace de noms.
   - job_name: node
-    dockerswarm_sd_configs:
-      - host: tcp://docker-socket-proxy:2375
-        role: tasks
-        port: 9100
-        refresh_interval: 30s
-    relabel_configs:
-      - source_labels: [__meta_dockerswarm_service_label_prometheus_job]
-        regex: node-exporter
-        action: keep
-      - source_labels: [__meta_dockerswarm_task_desired_state]
-        regex: running
-        action: keep
-      - source_labels: [__meta_dockerswarm_task_address]
-        regex: "([^:]+)(?::\\d+)?"
-        replacement: "$1:9100"
-        target_label: __address__
-      # instance = the node hostname. This is the deliberate difference from
-      # the swarm-tasks job.
-      - source_labels: [__meta_dockerswarm_node_hostname]
-        target_label: instance
-      - source_labels: [__meta_dockerswarm_node_hostname]
-        target_label: node
+    static_configs:
+      - targets: ["node-exporter:9100"]
 
+  # Métriques par conteneur. C'est cette source qui répond à « quel service
+  # consomme la mémoire » et « lequel vient de redémarrer ».
   - job_name: cadvisor
-    dockerswarm_sd_configs:
-      - host: tcp://docker-socket-proxy:2375
-        role: tasks
-        port: 8080
-        refresh_interval: 30s
-    relabel_configs:
-      - source_labels: [__meta_dockerswarm_service_label_prometheus_job]
-        regex: cadvisor
-        action: keep
-      - source_labels: [__meta_dockerswarm_task_desired_state]
-        regex: running
-        action: keep
-      - source_labels: [__meta_dockerswarm_task_address]
-        regex: "([^:]+)(?::\\d+)?"
-        replacement: "$1:8080"
-        target_label: __address__
-      - source_labels: [__meta_dockerswarm_node_hostname]
-        target_label: instance
-      - source_labels: [__meta_dockerswarm_node_hostname]
-        target_label: node
-    metric_relabel_configs:
-      # cAdvisor is by far the most cardinality-heavy exporter: it publishes
-      # dozens of series per container, many of them per-filesystem or
-      # per-network-interface. Keeping only what the "Conteneurs" dashboard and
-      # the ContainerRestarting rule use divides the series count by roughly
-      # ten on this cluster.
-      - source_labels: [__name__]
-        regex: "container_(cpu_usage_seconds_total|memory_usage_bytes|memory_working_set_bytes|network_receive_bytes_total|network_transmit_bytes_total|fs_usage_bytes|fs_limit_bytes|start_time_seconds|last_seen|spec_memory_limit_bytes)"
-        action: keep
-      # Drop the aggregate "POD"/root cgroup series, which double-count.
-      - source_labels: [id]
-        regex: "/"
-        action: drop
-
-  # ---------------------------------------------------------------------------
-  # 4. Docker Engine — the daemon's own metrics
-  #
-  # Static, because the engine is a HOST service: it is not a Swarm task and
-  # cannot be discovered through the API. Enabled by `metrics-addr` in
-  # daemon.json (Ansible role `docker`), bound to the cluster IP and filtered.
-  # ---------------------------------------------------------------------------
-  - job_name: docker-engine
     static_configs:
-      - targets:
-          - "192.168.56.11:9323"
-          - "192.168.56.12:9323"
-          - "192.168.56.13:9323"
-    relabel_configs:
-      - source_labels: [__address__]
-        regex: "192\\.168\\.56\\.11:.*"
-        target_label: node
-        replacement: node1
-      - source_labels: [__address__]
-        regex: "192\\.168\\.56\\.12:.*"
-        target_label: node
-        replacement: node2
-      - source_labels: [__address__]
-        regex: "192\\.168\\.56\\.13:.*"
-        target_label: node
-        replacement: node3
+      - targets: ["cadvisor:8080"]
 
-  # ---------------------------------------------------------------------------
-  # 5. MariaDB — multi-target exporter
-  #
-  # One mysqld-exporter instance probes the three Galera members through
-  # `/probe?target=…`. The alternative — three exporter services — would mean
-  # three more containers and three more secrets for identical work.
-  # ---------------------------------------------------------------------------
-  - job_name: mysqld
-    metrics_path: /probe
-    params:
-      auth_module: [client]
+  # Trafic vu par le reverse proxy : le seul endroit où l'on voit les erreurs
+  # telles que les utilisateurs les subissent.
+  - job_name: traefik
     static_configs:
-      - targets: ["galera-1:3306", "galera-2:3306", "galera-3:3306"]
-    relabel_configs:
-      - source_labels: [__address__]
-        target_label: __param_target
-      # `instance` = the member name, so a Galera graph reads galera-1/2/3
-      # rather than an exporter address.
-      - source_labels: [__param_target]
-        regex: "([^:]+):.*"
-        target_label: instance
-        replacement: "$1"
-      # Send the request to the exporter, not to the database.
-      - target_label: __address__
-        replacement: mysqld-exporter:9104
-
-  # ---------------------------------------------------------------------------
-  # 6. Blackbox — availability from the USER's point of view
-  #
-  # Everything above measures the platform from the inside. These probes go
-  # through the VIP, over TLS, exactly like a browser: they are the only
-  # measurements that would catch a broken Traefik router, an expired
-  # certificate or a VIP that failed to move.
-  # ---------------------------------------------------------------------------
-  - job_name: blackbox-http
-    metrics_path: /probe
-    params:
-      module: [http_2xx]
-    static_configs:
-      - targets:
-          - "https://grafana.${DOMAIN}/api/health"
-          - "https://kibana.${DOMAIN}/api/status"
-          - "https://minio.${DOMAIN}/minio/health/live"
-          - "https://whoami.${DOMAIN}/"
-    relabel_configs:
-      - source_labels: [__address__]
-        target_label: __param_target
-      - source_labels: [__param_target]
-        target_label: instance
-      - target_label: __address__
-        replacement: blackbox-exporter:9115
-
-  # GLPI has its own module: it must answer 200 AND the body must contain
-  # "GLPI". A maintenance page or a Traefik error page also returns 200.
-  - job_name: blackbox-glpi
-    metrics_path: /probe
-    params:
-      module: [http_2xx_glpi]
-    static_configs:
-      - targets: ["https://glpi.${DOMAIN}/"]
-    relabel_configs:
-      - source_labels: [__address__]
-        target_label: __param_target
-      - source_labels: [__param_target]
-        target_label: instance
-      - target_label: __address__
-        replacement: blackbox-exporter:9115
-
-  # ICMP on the VIP: the single most important probe of the platform. If this
-  # fails, nothing else is reachable, whatever the other probes say.
-  - job_name: blackbox-icmp
-    metrics_path: /probe
-    params:
-      module: [icmp]
-    static_configs:
-      - targets: ["${VIP}"]
-    relabel_configs:
-      - source_labels: [__address__]
-        target_label: __param_target
-      - source_labels: [__param_target]
-        target_label: instance
-      - target_label: __address__
-        replacement: blackbox-exporter:9115
-
-  # TCP reachability of the internal services that have no HTTP endpoint.
-  - job_name: blackbox-tcp
-    metrics_path: /probe
-    params:
-      module: [tcp_connect]
-    static_configs:
-      - targets:
-          - "db-proxy:3306"
-          - "es-1:9200"
-          - "cassandra-1:9042"
-    relabel_configs:
-      - source_labels: [__address__]
-        target_label: __param_target
-      - source_labels: [__param_target]
-        target_label: instance
-      - target_label: __address__
-        replacement: blackbox-exporter:9115
-
-  # ---------------------------------------------------------------------------
-  # 7. Backup metrics
-  #
-  # The backup jobs write a textfile-format .prom onto the shared NFS
-  # directory; an nginx serves it. This is what BackupTooOld and BackupFailed
-  # evaluate.
-  # ---------------------------------------------------------------------------
-  - job_name: backup
-    scrape_interval: 60s
-    # 60 s and not 15 s: these metrics change a few times a day. Scraping them
-    # four times a minute would only cost NFS reads.
-    static_configs:
-      # 8080 and not 80: the nginx runs unprivileged with cap_drop [ALL], so it
-      # cannot bind a port below 1024 (see config/backup/nginx.conf).
-      - targets: ["backup-metrics:8080"]
+      - targets: ["traefik:8082"]

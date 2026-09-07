@@ -1,31 +1,15 @@
-# Local environment & secrets — never commit
+# --- Ce qui ne doit jamais entrer dans le dépôt ------------------------------
+# Mots de passe réels, empreintes et clés privées.
 .env
 secrets/
 certs/
-*.pem
 *.key
 *.crt
-!config/**/*.example
+*.pem
 
-# Vagrant / Ansible
-.vagrant/
-*.retry
-ansible/inventory/hosts.yml
+# --- Produits par l'exécution ------------------------------------------------
+backups/
 
-# Tooling
-.venv/
-__pycache__/
-*.pyc
-node_modules/
+# --- Bruit des systèmes de fichiers ------------------------------------------
 .DS_Store
-*.log
-
-# Ansible controller artefacts
-.ansible/
-ansible/inventory/hosts.yml
-
-# Test and drill reports (only the ones copied into docs/ are committed)
-reports/
-
-# Rendered configuration (produced by scripts/lib/render.sh at deploy time)
-.rendered/
+*.swp
