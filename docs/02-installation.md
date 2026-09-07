@@ -1,285 +1,264 @@
-# Installation
+# 02 — Installation et utilisation
 
-> **Objet** : monter la plateforme de zéro, sur trois VM ou sur un poste unique.
-> **Références** : CDC §3, §11.1 ; [ADR-0002](adr/0002-vagrant-ansible.md).
-> Pour comprendre ce qui est monté : [`01-architecture.md`](01-architecture.md).
+Procédure complète pour installer la plateforme sur une machine disposant de
+Docker, y accéder, et résoudre les problèmes courants.
 
 ---
 
 ## 1. Prérequis
 
-Sur le **poste d'administration** (la machine depuis laquelle vous pilotez) :
-
-| Outil | Version minimale | Vérifier |
+| Élément | Minimum | Vérification |
 |---|---|---|
-| VirtualBox | 7.0 | `VBoxManage --version` |
-| Vagrant | 2.4 | `vagrant --version` |
-| Ansible | 2.16 (ansible-core) | `ansible --version` |
-| make, git, curl, openssl | — | `make -v && git --version` |
-| python3 | 3.10 | `python3 --version` |
+| Docker Engine | 24.0 | `docker --version` |
+| Plugin Compose | v2.20 | `docker compose version` |
+| Mémoire libre | 6 Go | `free -h` |
+| Disque libre | 10 Go | `df -h /var/lib/docker` |
+| `openssl` | présent | `openssl version` |
 
-Matériel : **20 Gio de RAM libres** et 4 cœurs pour le profil `full`
-(3 × 6 Gio + le poste). Avec moins, voir le profil `light` au §3.
+> **Sur Docker Desktop (macOS, Windows)**, la mémoire allouée à la machine
+> virtuelle est de 2 Go par défaut : c'est insuffisant, Elasticsearch et
+> Cassandra seront tués au démarrage. Réglez-la à **au moins 6 Go** dans
+> *Settings → Resources* avant de commencer.
 
-Les nœuds n'ont besoin de rien : Vagrant fabrique les VM, Ansible installe tout
-le reste (Docker, pare-feu, NFS, Keepalived, Swarm, réseaux, labels).
+---
 
-```bash
-git clone <url-du-dépôt> dockerwarts && cd dockerwarts
-ansible-galaxy collection install -r ansible/requirements.yml
-```
+## 2. Installation
 
-## 2. Le tour rapide
-
-Six commandes, dans cet ordre. Chacune est détaillée ensuite.
+### Étape 1 — Récupérer le dépôt
 
 ```bash
-cp .env.example .env                                   # 1. paramètres
-cp ansible/inventory/hosts.yml.example ansible/inventory/hosts.yml
-make vms provision                                     # 2. VM + hôtes + Swarm  (~15 min)
-make secrets certs                                     # 3. secrets et certificats
-make build                                             # 4. images maison
-make deploy                                            # 5. les 5 stacks, dans l'ordre  (~10 min)
-make smoke ARGS=--no-backup                                 # 6. validation
-make hosts | sudo tee -a /etc/hosts                    # 7. accéder depuis le navigateur
+git clone <url-du-dépôt>
+cd cci-workshop-poudlard
 ```
 
-`make help` liste toutes les cibles.
-
-## 3. Étape 1 — `.env`
-
-Le fichier `.env` n'est **jamais** commité (il est dans `.gitignore`), et
-`.env.example` en est le modèle à jour.
-
-| Variable | Défaut | À changer si… |
-|---|---|---|
-| `DOMAIN` | `dockerwarts.lan` | vous avez un vrai domaine (le certificat le suit) |
-| `VIP` | `192.168.56.10` | le réseau host-only VirtualBox est ailleurs |
-| `NODE1_IP` … `NODE3_IP` | `.11` `.12` `.13` | idem |
-| `CLUSTER_CIDR` | `192.168.56.0/24` | idem — c'est ce que le pare-feu autorise entre nœuds |
-| **`ADMIN_CIDR`** | `192.168.56.1/32` | **l'IP de votre poste** : c'est la liste blanche des interfaces d'administration |
-| `PROFILE` | `full` | `light` sur une machine modeste : réduit les *heaps* JVM |
-| `NODE_MEM` / `NODE_CPU` | 6144 / 4 | ressources par VM |
-| `DATA_NETWORK_ENCRYPTED` | `true` | ne le passez à `false` qu'en connaissance de cause (ADR-0007) |
-| `NFS_SERVER` | `192.168.56.11` | après une bascule NFS (voir [`07-PRA.md`](07-PRA.md)) |
-| `REGISTRY` | `192.168.56.13:5000` | registre interne |
-| `IMAGE_TAG` | `1.0.0` | **à incrémenter à chaque `make build`** : un tag existant n'est pas écrasé |
-| `TZ` | `Europe/Paris` | fuseau des conteneurs (les sauvegardes restent en UTC) |
-| `OFFSITE_S3_*` | vides | **à renseigner** pour satisfaire la règle 3-2-1 (§9) |
-| `SMTP_*`, `ALERT_EMAIL_TO` | vides | notifications par courriel en plus des tickets GLPI |
-| `DEMO_RATE`, `DEMO_SENSORS` | 20 / 50 | charge de la démo |
-
-> **`ADMIN_CIDR` est le paramètre le plus important de ce fichier.** Il décide
-> qui peut atteindre Traefik, Prometheus, Alertmanager, Grafana, Kibana et la
-> console MinIO. Le laisser trop large ouvre six interfaces d'administration ;
-> le rendu de configuration **échoue** s'il est vide, précisément pour que
-> l'oubli ne produise pas une liste blanche vide (donc permissive).
-
-L'inventaire Ansible (`ansible/inventory/hosts.yml`) reprend les mêmes adresses ;
-il porte aussi `dw_keepalived_password`, à changer.
-
-## 4. Étape 2 — `make vms provision`
+### Étape 2 — Préparer les secrets
 
 ```bash
-make vms          # vagrant up : 3 VM bento/ubuntu-24.04, réseau host-only
-make provision    # ansible-playbook site.yml
+make init
 ```
 
-Ce que le *provisioning* installe, rôle par rôle :
+Cette commande, **idempotente** (on peut la relancer sans rien perdre), produit
+les trois choses qui ne peuvent pas être versionnées :
 
-| Rôle | Ce qu'il fait |
+- **`.env`** — copié depuis `.env.example`, avec quatre mots de passe tirés au
+  hasard. Rien de plus dangereux qu'un `change-me` qu'on oublie de changer.
+- **`certs/dockerwarts.{crt,key}`** — un certificat TLS auto-signé valable
+  825 jours, pour `*.dockerwarts.local`.
+- **`secrets/users.htpasswd`** — l'empreinte du compte d'administration. Le mot
+  de passe en clair n'est jamais écrit sur le disque, seulement son empreinte.
+
+Ces trois chemins sont dans `.gitignore` : ils ne peuvent pas partir dans git.
+
+### Étape 3 — Résoudre les noms
+
+`make init` affiche la ligne à ajouter. C'est la seule étape qui demande
+`sudo`, et elle ne se fait qu'une fois :
+
+```bash
+sudo tee -a /etc/hosts <<'EOF'
+127.0.0.1 glpi.dockerwarts.local grafana.dockerwarts.local kibana.dockerwarts.local prometheus.dockerwarts.local traefik.dockerwarts.local
+EOF
+```
+
+> Sur Windows, le fichier est `C:\Windows\System32\drivers\etc\hosts`, à éditer
+> en tant qu'administrateur.
+
+### Étape 4 — Démarrer
+
+```bash
+make up          # ou : docker compose up -d
+```
+
+Le premier démarrage dure **environ trois minutes**. Il ne se passe rien
+d'anormal pendant ce temps :
+
+| Temps | Ce qui se passe |
 |---|---|
-| `common` | paquets de base, fuseau, sysctls (`vm.max_map_count`, `swappiness=1`…), fail2ban |
-| `docker` | Docker Engine **figé** (`apt-mark hold`), `daemon.json`, journalisation json-file |
-| `firewall` | chaînes `DW-INPUT` et `DOCKER-USER`, persistées et rejouées au démarrage |
-| `nfs-server` | sur node1 : les 5 exports (`/srv/nfs/...`) |
-| `nfs-client` | paquets clients sur les trois |
-| `keepalived` | VRRP, VIP, `chk_traefik` |
-| `swarm` | `swarm init` puis `join`, et les 5 overlays |
-| `node-labels` | les labels de placement, avec assertion de relecture |
+| 0 – 30 s | Traefik, MariaDB, node-exporter et cAdvisor démarrent |
+| 30 s – 1 min | Elasticsearch et Cassandra initialisent leurs volumes |
+| 1 – 3 min | GLPI installe sa base ; Kibana et Grafana se connectent |
 
-**Vérifier :**
+Les dépendances sont déclarées avec `condition: service_healthy` : GLPI
+n'essaie pas de s'installer avant que MariaDB accepte vraiment des connexions.
+C'est ce qui rend le démarrage fiable au lieu d'aléatoire.
 
-```bash
-make provision            # une seconde exécution doit afficher changed=0
-vagrant ssh node1 -c 'docker node ls'        # 3 nœuds Ready, un seul Leader
-ping -c 3 192.168.56.10                      # la VIP répond
-vagrant ssh node1 -c 'sudo iptables -S DW-INPUT'
-```
-
-L'idempotence n'est pas un détail de style : c'est ce qui permet de rejouer
-`make provision` après un incident sans se demander ce qu'on va casser.
-
-## 5. Étape 3 — `make secrets certs`
+### Étape 5 — Vérifier
 
 ```bash
-make secrets      # 41 secrets générés dans secrets/, puis créés dans Swarm
-make certs        # CA interne, wildcard *.DOMAIN, certificats transport ES
+make verify
 ```
 
-`scripts/init-secrets.sh` génère ce qui manque et ne touche jamais à ce qui
-existe. Les valeurs vivent dans `secrets/` (mode 700, dans `.gitignore`) **et**
-comme objets Docker.
+Ce script ne se contente pas de regarder si les conteneurs tournent : il
+interroge **chaque service dans son propre protocole** — une requête SQL sur
+MariaDB, `status.php` sur GLPI, l'API `_cluster/health` sur Elasticsearch,
+`nodetool status` et une requête CQL sur Cassandra, `/api/health` sur Grafana.
+Il vérifie aussi que Prometheus voit bien ses quatre sources, que HTTP est
+redirigé vers HTTPS, et que Prometheus refuse un accès anonyme.
 
-> **⚠️ Sauvegardez `secrets/` et `certs/ca.key` hors du cluster, dans un coffre,
-> maintenant.**
-> Sans `dw_restic_password`, aucune sauvegarde n'est restaurable : c'est la clé
-> de chiffrement AES-256 du dépôt, et elle n'existe nulle part ailleurs. Sans la
-> CA, il faut regénérer tous les certificats lors d'une reconstruction.
-> `scripts/init-secrets.sh` le rappelle à la fin de son exécution.
+Il sort en code 1 s'il trouve le moindre problème : utilisable dans une tâche
+planifiée.
 
-```bash
-scripts/init-secrets.sh --list     # ce qui existe localement et dans Swarm
-```
+---
 
-## 6. Étape 4 — `make build`
+## 3. Accès aux interfaces
 
-```bash
-make build        # déploie le registre interne si besoin, puis construit et pousse
-```
-
-Quatre images maison : `cassandra` (agent JMX embarqué), `alert2glpi`,
-`backup-runner`, `demo-producer`. Elles sont poussées dans le registre interne
-avec le tag `${IMAGE_TAG}`.
-
-**`make build` refuse d'écraser un tag existant.** Après une modification :
-incrémentez `IMAGE_TAG` dans `.env`, ou passez `--force` en connaissance de
-cause. C'est ce qui rend le tag immuable en pratique et garantit que les trois
-nœuds exécutent le même contenu.
-
-## 7. Étape 5 — `make deploy`
-
-```bash
-make deploy               # les 5 stacks, dans l'ordre, avec attente de santé
-make deploy-data          # une seule stack
-make status               # services, nœuds, santé des clusters
-```
-
-L'ordre est imposé par les dépendances : GLPI ne peut pas s'installer avant
-Galera, et Prometheus découvre ses cibles une fois les applications présentes.
-`deploy.sh` enchaîne aussi les initialisations au bon moment :
-
-| Après | Initialisation | Ce qu'elle fait |
+| Service | Adresse | Identifiants |
 |---|---|---|
-| bootstrap Galera | `galera-bootstrap.sh` | la séquence en 5 étapes, y compris **le retrait du drapeau de bootstrap** que tout le monde oublie |
-| `data` | `cassandra-init.sh` | remplace le superutilisateur par défaut, RF=3 sur `system_auth`, schéma, **aller-retour réel en LOCAL_QUORUM** |
-| `data` | `es-init.sh` | mots de passe, rôles, ILM, templates, data streams, vues Kibana |
-| `apps` | `glpi-init.sh` | **détruit les 4 mots de passe par défaut**, injecte les jetons API, vérifie par un vrai `initSession` |
-| `backup` | `minio-init.sh` | buckets, versioning, politiques, comptes, **test d'isolation**, puis rappelle `es-init.sh` |
+| **GLPI** | https://glpi.dockerwarts.local | `glpi` / `glpi` (à changer immédiatement) |
+| **Grafana** | https://grafana.dockerwarts.local | `admin` / voir `.env` |
+| **Kibana** | https://kibana.dockerwarts.local | compte d'administration Traefik |
+| **Prometheus** | https://prometheus.dockerwarts.local | compte d'administration Traefik |
+| **Traefik** | https://traefik.dockerwarts.local | compte d'administration Traefik |
 
-Comptez ~10 min : Cassandra et Elasticsearch démarrent lentement, et c'est
-normal (`start_period` de 240 s sur Cassandra).
-
-## 8. Étape 6 — Valider
+Pour lire les mots de passe générés :
 
 ```bash
-make smoke ARGS=--no-backup     # avant la première sauvegarde
-tests/smoke/network-isolation.sh
+grep -E 'GRAFANA_PASSWORD|ADMIN_' .env
 ```
 
-Le test de fumée passe par la **VIP**, en HTTPS, avec la CA interne : il éprouve
-Keepalived, Traefik, le certificat, les routeurs et les middlewares, puis l'état
-des trois clusters et la supervision. Il vérifie aussi que les interfaces
-d'administration sont **protégées** — un 200 sans identifiants y est un échec.
+### Deux points d'attention au premier accès
 
-## 9. Étape 7 — Accéder depuis le navigateur
+**Le navigateur affiche un avertissement de sécurité.** C'est attendu : le
+certificat est auto-signé, aucune autorité ne le reconnaît. Le chiffrement est
+bien réel, seule l'identité n'est pas vérifiable. Acceptez l'exception.
 
-Il n'y a pas de DNS dans le laboratoire :
+**GLPI démarre avec les comptes par défaut** (`glpi/glpi`, `tech/tech`,
+`post-only/postonly`, `normal/normal`). Ils sont publics et connus de tous.
+Changez-les à la première connexion : GLPI affiche lui-même un avertissement
+tant que ce n'est pas fait.
+
+---
+
+## 4. Commandes du quotidien
 
 ```bash
-make hosts | sudo tee -a /etc/hosts
+make ps                      # état des conteneurs
+make logs                    # tous les journaux, en continu
+make logs S=glpi             # ceux d'un seul service
+make verify                  # contrôle applicatif complet
+make restart                 # redémarrage de tous les services
+make down                    # arrêt — les données sont conservées
+make up                      # redémarrage
+make config                  # configuration Compose résolue (variables remplacées)
 ```
 
-| URL | Accès |
-|---|---|
-| `https://glpi.dockerwarts.lan` | public |
-| `https://whoami.dockerwarts.lan` | public (validation) |
-| `https://grafana.dockerwarts.lan` | liste blanche `ADMIN_CIDR` |
-| `https://prometheus.dockerwarts.lan` | liste blanche + *basic auth* |
-| `https://alertmanager.dockerwarts.lan` | idem |
-| `https://kibana.dockerwarts.lan` | idem |
-| `https://minio.dockerwarts.lan` | idem (console uniquement) |
-| `https://traefik.dockerwarts.lan` | idem |
-
-Le certificat est signé par la CA interne : importez `certs/ca.crt` dans le
-navigateur, ou acceptez l'avertissement. Identifiants *basic auth* :
-`admin` / `secrets/dw_traefik_admin_password.txt`.
-
-## 10. Après l'installation
+Interroger une base directement, sans jamais exposer son port :
 
 ```bash
-make backup-now        # première sauvegarde ; produit un rapport Markdown
-make dr-drill          # exercice de reprise : restaure vraiment, à côté de la production
-make deploy-demo       # charge de fond, à lancer AVANT make chaos
-make chaos             # campagne HA (~30 min)
+docker compose exec db mariadb -uroot -p"$(grep DB_ROOT_PASSWORD .env | cut -d= -f2)" glpi
+docker compose exec cassandra cqlsh -e "SELECT * FROM dockerwarts.sante"
+docker compose exec elasticsearch curl -s localhost:9200/_cat/indices?v
 ```
 
-**Renseignez `OFFSITE_S3_*`** : sans copie hors site, la règle 3-2-1 n'est pas
-satisfaite et perdre node3 perd toutes les sauvegardes. Le job le signale à
-chaque passage.
+---
 
-## 11. Mode mono-nœud (développement)
-
-> **Un document entier y est consacré** : [`09-test-local.md`](09-test-local.md)
-> — préparation du poste, les quatre variables de `.env` à changer, ce qui se
-> teste réellement en local et ce qui ne s'y teste pas.
+## 5. Sauvegarde et restauration
 
 ```bash
-make single-prepare ARGS=--fix    # Swarm, réseaux overlay, chemins hôte
-make secrets certs build
-make single
+make backup                              # sauvegarde complète, horodatée
+make restore FROM=backups/2026-09-07_03-00-00
 ```
 
-Un poste, un Swarm à un nœud, les mêmes définitions. C'est un mode d'itération
-rapide, **pas** une petite production :
+La procédure, les objectifs de temps de reprise et les tests à effectuer sont
+détaillés dans [`05-PRA.md`](05-PRA.md).
 
-- Galera tourne seul : pas de quorum, pas de réplication synchrone ;
-- Cassandra est en RF=1 ;
-- Elasticsearch reste `yellow` **pour toujours** — c'est l'état correct sur un
-  nœud, pas un problème ;
-- Keepalived, la VIP et la bascule n'existent pas : Traefik prend les ports du
-  poste.
+---
 
-`make smoke` signalera des échecs (3 nœuds, Galera à 3, ES `green`) et il a
-raison : ces contrôles décrivent la topologie de production. Les fichiers
-réellement déployés sont conservés dans `.rendered/single-<stack>.yml` — c'est
-là qu'il faut regarder si un service se comporte étrangement dans ce mode. Les
-limites sont détaillées dans [`06-haute-disponibilite.md`](06-haute-disponibilite.md#6-mode-mono-nœud--ce-quil-ne-teste-pas).
+## 6. Dépannage
 
-## 12. Dépannage
+### Elasticsearch redémarre en boucle
 
-| Symptôme | Cause probable | Quoi faire |
-|---|---|---|
-| Un service reste `0/1` | contrainte de placement insatisfaite (labels absents) | `docker service ps <svc> --no-trunc` ; rejouer `make provision` |
-| `wsrep_cluster_size = 1` | le drapeau de bootstrap n'a pas été retiré | `docker service inspect data_galera-1 \| grep GALERA_BOOTSTRAP` → doit valoir 0 ; sinon `scripts/galera-bootstrap.sh` |
-| Galera ne démarre plus du tout | arrêt total, plus de nœud « sûr » | `scripts/galera-recover.sh --dry-run` puis sans l'option |
-| Elasticsearch `red` | shards non alloués | `curl .../_cluster/allocation/explain` ; voir [`07-PRA.md`](07-PRA.md) |
-| Elasticsearch refuse de démarrer | `vm.max_map_count` | déjà posé par le rôle `common` ; `sysctl vm.max_map_count` doit valoir 262144 |
-| La VIP ne répond pas | Keepalived ou Traefik local | `journalctl -u keepalived -n 50` ; `curl http://127.0.0.1/ping` sur le nœud |
-| 403 sur toutes les URL | votre IP est bannie par CrowdSec | `cscli decisions list` puis `cscli decisions delete --ip <ip>` |
-| 403 sur les seules URL d'admin | `ADMIN_CIDR` ne contient pas votre IP | corriger `.env`, `make deploy-edge` |
-| `image not found` au déploiement | `make build` non fait, ou `IMAGE_TAG` incohérent | `curl http://192.168.56.13:5000/v2/_catalog` |
-| Une config modifiée n'est pas prise en compte | objet config Swarm immuable | le hash de contenu roule le service : redéployer la stack suffit |
-| GLPI en erreur 500 après restauration | privilèges non rechargés | `FLUSH PRIVILEGES` (fait par `restore-galera.sh`) |
-| Une sauvegarde échoue en boucle | MinIO plein, ou secret manquant | `make status` ; `MinIOCapacityLow` ; `scripts/init-secrets.sh --list` |
+Regardez d'abord les journaux : `make logs S=elasticsearch`.
 
-**Les journaux, dans l'ordre où on les regarde :**
+**`max virtual memory areas vm.max_map_count [65530] is too low`** — le noyau de
+l'hôte n'accorde pas assez de zones mémoire. Sous Linux :
 
 ```bash
-make status                                  # vue d'ensemble
-docker service ps <service> --no-trunc       # pourquoi une tâche ne démarre pas
-docker service logs --tail 100 <service>     # ce que le service dit
-journalctl -u docker -n 100                  # ce que le démon dit
-https://kibana.dockerwarts.lan               # tous les logs, centralisés et cherchables
+sudo sysctl -w vm.max_map_count=262144
+# Pour que ce soit permanent :
+echo 'vm.max_map_count=262144' | sudo tee /etc/sysctl.d/99-elasticsearch.conf
 ```
 
-## 13. Désinstaller
+**Le conteneur est tué sans message** — il manque de mémoire. Réduisez `ES_HEAP`
+dans `.env` (par exemple `512m`) puis `docker compose up -d elasticsearch`.
+
+### Elasticsearch est « unhealthy » et l'état du cluster est `red`
 
 ```bash
-make destroy       # vagrant destroy -f : les 3 VM disparaissent
+docker compose exec elasticsearch curl -s 'http://localhost:9200/_cluster/health?pretty'
 ```
 
-Les secrets et certificats locaux restent dans `secrets/` et `certs/`.
-Supprimez-les explicitement si vous ne comptez pas reconstruire — et vérifiez
-d'abord que votre coffre en a une copie, car aucune sauvegarde restic n'est
-lisible sans eux.
+Si les journaux mentionnent `high disk watermark [90%] exceeded`, le disque est
+en cause : Elasticsearch refuse d'allouer le moindre shard au-delà de 90 %
+d'occupation, ce qui met le cluster en `red`.
+
+Cette plateforme fixe déjà les seuils en **valeurs absolues** plutôt qu'en
+pourcentage (`5gb` / `3gb` / `2gb` dans `docker-compose.yml`), précisément parce
+qu'un seuil à 90 % sur un disque de 250 Go déclenche alors qu'il reste 25 Go
+parfaitement utilisables. S'il reste réellement moins de 3 Go, il faut faire de
+la place — c'est le disque qui est plein, pas Elasticsearch qui se trompe.
+
+### GLPI affiche une erreur de base de données
+
+L'installation automatique a échoué. Deux causes fréquentes :
+
+1. **MariaDB n'était pas prête.** Ne devrait pas arriver grâce à
+   `condition: service_healthy`, mais si c'est le cas :
+   `docker compose restart glpi`.
+2. **Les mots de passe ne concordent plus** — typiquement après avoir modifié
+   `.env` alors que le volume `db_data` existait déjà. MariaDB ne crée son
+   utilisateur qu'au **tout premier** démarrage : changer `DB_PASSWORD` ensuite
+   ne change rien dans la base. Il faut soit repartir de zéro
+   (`docker compose down -v`, qui **efface les données**), soit changer le mot de
+   passe dans la base elle-même.
+
+### Cassandra reste « starting » très longtemps
+
+C'est normal : le premier démarrage prend une à deux minutes. La sonde laisse
+`start_period: 120s` avant de commencer à compter les échecs. Au-delà de trois
+minutes, vérifiez la mémoire : `MAX_HEAP_SIZE` **et** `HEAP_NEWSIZE` doivent
+tous les deux être définis, Cassandra refuse de démarrer si un seul l'est.
+
+### « 404 page not found » sur une adresse
+
+Traefik n'a pas de route pour ce nom d'hôte. Vérifiez dans l'ordre :
+
+1. Le nom est bien dans `/etc/hosts`.
+2. `DOMAIN` dans `.env` correspond bien au nom demandé.
+3. Le conteneur visé tourne : `make ps`.
+4. Le tableau de bord Traefik liste bien le routeur :
+   https://traefik.dockerwarts.local
+
+### « 403 Forbidden » sur Prometheus, Kibana ou Grafana
+
+C'est le **filtrage IP qui fonctionne**, pas une panne. Votre adresse n'est pas
+dans `ADMIN_CIDR`. Vérifiez l'adresse vue par Traefik dans ses journaux
+(`make logs S=traefik`) et ajoutez la plage correspondante dans `.env`, puis
+`docker compose up -d traefik`.
+
+### Un port est déjà utilisé
+
+```
+Error: bind: address already in use
+```
+
+Un autre service occupe le port 80 ou 443 sur la machine (souvent Apache ou
+Nginx). Arrêtez-le, ou changez le mappage dans `docker-compose.yml`
+(`"8080:80"` et `"8443:443"`).
+
+### Tout reprendre à zéro
+
+```bash
+make clean       # demande confirmation, SUPPRIME toutes les données
+make init && make up
+```
+
+---
+
+## 7. Désinstallation
+
+```bash
+docker compose down -v        # conteneurs, réseaux et volumes
+docker image prune -a         # images téléchargées
+rm -rf .env certs secrets backups
+```

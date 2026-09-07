@@ -1,328 +1,255 @@
-# Architecture
+# 01 — Architecture
 
-> **Objet** : vue d'ensemble de la plateforme Dockerwarts N°1 — ce qui tourne, où,
-> pourquoi, et comment les morceaux se parlent.
-> **Références** : CDC §3 à §8 ; les dix [ADR](adr/README.md).
-> Pour installer : [`02-installation.md`](02-installation.md). Pour un composant
-> en particulier : [`04-composants/`](04-composants/).
+Ce document décrit ce qui compose la plateforme, comment les briques
+communiquent, et **pourquoi** ces outils plutôt que d'autres.
 
 ---
 
-## 1. Ce que la plateforme fait
+## 1. Vue d'ensemble
 
-Une infrastructure dockerisée, hautement disponible, qui rend quatre services :
-
-| Service | Pour qui | Où |
-|---|---|---|
-| **Ticketing GLPI** | les utilisateurs | `https://glpi.dockerwarts.lan` |
-| **Historisation des logs** (Elasticsearch + Kibana) | l'exploitation | `https://kibana.dockerwarts.lan` |
-| **Supervision** (Prometheus + Grafana + Alertmanager) | l'exploitation | `https://grafana.dockerwarts.lan` |
-| **Datalake capteurs** (Cassandra) | les applications métier | interne, réseau `data` |
-
-Autour, ce qui rend l'ensemble exploitable : un pare-feu à quatre couches, des
-sauvegardes chiffrées et vérifiées, un plan de reprise testé, et une boucle qui
-transforme une alerte en **ticket GLPI** sans intervention humaine.
-
-## 2. Le socle : trois nœuds égaux
-
-```mermaid
-flowchart TB
-  subgraph net["Réseau host-only 192.168.56.0/24"]
-    VIP(["VIP 192.168.56.10<br/>Keepalived VRRP"])
-
-    subgraph n1["node1 · 192.168.56.11"]
-      direction TB
-      n1r["manager Swarm · priorité VRRP 150"]
-      n1s["galera-1 · cassandra-1 · es-1<br/>prometheus A · **export NFS**"]
-    end
-    subgraph n2["node2 · 192.168.56.12"]
-      direction TB
-      n2r["manager Swarm · priorité 100"]
-      n2s["galera-2 · cassandra-2 · es-2<br/>prometheus B"]
-    end
-    subgraph n3["node3 · 192.168.56.13"]
-      direction TB
-      n3r["manager Swarm · priorité 50"]
-      n3s["galera-3 · cassandra-3 · es-3<br/>**MinIO** · **CrowdSec LAPI** · registry"]
-    end
-  end
-
-  VIP -.->|"portée par un seul nœud à la fois"| n1
-  n1 <-->|"Raft · gossip · réplication"| n2
-  n2 <-->|"Raft · gossip · réplication"| n3
-  n1 <-->|"Raft · gossip · réplication"| n3
+```
+                        Internet / réseau local
+                                  │
+                          80 (→ 443) et 443
+                                  │
+                    ┌─────────────▼─────────────┐
+                    │          TRAEFIK          │   pare-feu applicatif
+                    │  TLS · filtrage IP · auth │   point d'entrée unique
+                    │  limitation de débit      │
+                    └─────────────┬─────────────┘
+                                  │
+        ┌──────────────┬──────────┴────────┬──────────────┐
+        │              │                   │              │
+   réseau proxy   réseau proxy        réseau proxy   réseau proxy
+        │              │                   │              │
+    ┌───▼───┐     ┌────▼────┐        ┌─────▼─────┐  ┌──────▼─────┐
+    │ GLPI  │     │ KIBANA  │        │ PROMETHEUS│  │  GRAFANA   │
+    └───┬───┘     └────┬────┘        └─────┬─────┘  └──────┬─────┘
+        │              │                   │               │
+════════╪══════════════╪═══════════════════╪═══════════════╪════════
+        │      réseau backend — internal: true, aucune sortie
+        │              │                   │               │
+    ┌───▼────┐   ┌─────▼────────┐   ┌──────▼──────┐  ┌─────▼──────┐
+    │MARIADB │   │ELASTICSEARCH │   │NODE-EXPORTER│  │  CADVISOR  │
+    └────────┘   └──────────────┘   └─────────────┘  └────────────┘
+                                    ┌─────────────┐
+                                    │  CASSANDRA  │   datalake
+                                    └─────────────┘
 ```
 
-**Trois managers, pas de workers.** Trois est le plus petit nombre qui donne un
-quorum Raft (2 sur 3) ; ajouter des workers ne changerait rien à la
-disponibilité du plan de contrôle et ajouterait des machines à administrer
-(ADR-0001).
+Dix services, deux réseaux, neuf volumes. Tout est décrit dans un seul fichier,
+`docker-compose.yml`, commenté ligne à ligne.
 
-**Les trois nœuds sont identiques**, à trois exceptions près, chacune assumée et
-documentée :
+---
 
-| Singularité | Nœud | Conséquence | Traitée dans |
-|---|---|---|---|
-| Export NFS des fichiers GLPI | node1 | SPOF : GLPI dégradé si node1 tombe | [ADR-0006](adr/0006-nfs-spof-assume.md), [`07-PRA.md`](07-PRA.md) |
-| MinIO (dépôt de sauvegarde) | node3 | SPOF : sauvegardes suspendues | [ADR-0008](adr/0008-minio-restic-sauvegardes.md) |
-| CrowdSec LAPI | node3 | replanifié par Swarm ; le bouncer garde ses décisions en cache | [`04-composants/crowdsec.md`](04-composants/crowdsec.md) |
+## 2. Les services, un par un
 
-Le placement est déclaré par des **labels Swarm** (`ansible/roles/node-labels/`)
-et les stacks s'y accrochent par `constraints`. Swarm n'ayant pas de
-*StatefulSet*, chaque membre d'un cluster à état est un **service distinct**,
-épinglé à son nœud, avec un volume **local**. Remplacer un nœud, c'est
-réappliquer les labels : les services épinglés s'y replanifient tout seuls.
+### Traefik v3.7 — point d'entrée et pare-feu applicatif
+
+C'est **le seul conteneur qui publie des ports** sur la machine : 80 et 443.
+Tout le reste est joignable uniquement à travers lui.
+
+Traefik découvre les services par les **labels** qu'ils portent. Ajouter une
+application exposée, c'est ajouter quatre labels sur son service — jamais
+éditer la configuration du proxy. C'est ce qui rend le fichier lisible malgré
+dix services.
+
+Il fait aussi office de pare-feu applicatif : terminaison TLS, redirection
+HTTP → HTTPS, filtrage par adresse IP, authentification, limitation de débit,
+en-têtes de sécurité. Le détail est dans
+[`03-securite.md`](03-securite.md).
+
+> **Pourquoi Traefik plutôt que Nginx ?** Nginx exige d'écrire un bloc `server`
+> par service et de recharger la configuration à chaque changement. Traefik lit
+> les labels Docker et se reconfigure seul. Sur une plateforme de dix services
+> qui bougent, la différence n'est pas cosmétique : c'est ce qui évite qu'une
+> configuration diverge silencieusement de la réalité.
+
+### GLPI 10.0 — le ticketing
+
+Outil de référence en gestion de parc et de tickets dans le monde francophone,
+libre, et proposant une **image officielle qui s'auto-installe** : les cinq
+variables `GLPI_DB_*` suffisent, il n'y a aucun assistant web à dérouler à la
+main. Une plateforme qui se reconstruit en une commande ne peut pas dépendre de
+quinze clics dans un navigateur.
+
+GLPI est le seul service ouvert au public : c'est l'application destinée aux
+utilisateurs finaux.
+
+### MariaDB 11.4 — la base de GLPI
+
+GLPI ne fonctionne qu'avec MySQL ou MariaDB. MariaDB est le choix recommandé
+par le projet GLPI lui-même. La version 11.4 est une **LTS**, maintenue
+jusqu'en 2029.
+
+Elle vit sur le réseau `backend` : GLPI seul la joint, personne d'autre.
+
+### Elasticsearch 8.19 — l'historisation des données
+
+Moteur de recherche et d'indexation orienté document. C'est l'outil cité par le
+sujet, et il est effectivement le standard pour conserver et interroger des
+volumes de journaux ou d'événements avec des recherches en texte intégral.
+
+Configuré en `discovery.type=single-node` : sur une machine unique, l'élection
+de maître n'aurait aucun sens et bloquerait le démarrage.
+
+> **Un mot sur l'état « yellow ».** Un nœud unique ne peut pas allouer les
+> répliques de ses index — elles devraient aller sur un autre nœud, qui n'existe
+> pas. L'état normal est donc `yellow`, pas `green`. La sonde de santé exige
+> `yellow` : exiger `green` laisserait le service éternellement « unhealthy »
+> alors qu'il fonctionne parfaitement.
+
+### Kibana 8.19 — l'exploration
+
+L'interface d'Elasticsearch. Sans elle, l'historisation est une boîte noire :
+on y écrit sans jamais rien relire. Kibana rend les données consultables par un
+humain, ce qui est la raison d'être de l'historisation.
+
+Version strictement identique à celle d'Elasticsearch : Kibana refuse de
+démarrer contre un Elasticsearch d'une autre version mineure.
+
+### Cassandra 5.0 — le datalake
+
+Base distribuée orientée colonnes, conçue pour absorber de très gros volumes
+d'écritures et grandir par ajout de nœuds. C'est l'outil cité par le sujet, et
+il correspond à ce qu'on attend d'un datalake : écritures massives, lectures par
+plage temporelle, croissance horizontale.
+
+Le schéma initial est dans [`config/cassandra/init.cql`](../config/cassandra/init.cql),
+joué une fois par le service `cassandra-init`.
+
+> **La clé de partition est la seule décision qui ne se rattrape pas.** Elle est
+> ici `(source, jour)`, parce que les lectures se font toujours « une source,
+> une journée ». Prendre l'identifiant de l'événement aurait donné une
+> répartition parfaite… et rendu impossible toute lecture par plage. C'est
+> l'erreur classique avec Cassandra, et elle impose de tout réécrire.
+
+### Prometheus 3.13 — la collecte
+
+Prometheus va chercher les métriques (*pull*) à intervalle fixe, plutôt que de
+les recevoir. C'est ce qui lui permet de savoir qu'une source **ne répond plus** :
+un système qui attend qu'on lui envoie des données ne peut pas distinguer
+« tout va bien, rien à signaler » de « la source est morte ».
+
+Quatre sources : lui-même, node-exporter, cAdvisor et Traefik. Rétention de
+30 jours.
+
+### Grafana 13 — le monitoring
+
+L'interface de consultation. Sa source de données et son tableau de bord sont
+**provisionnés depuis des fichiers versionnés** : une machine reconstruite
+retrouve exactement les mêmes écrans, sans qu'on recrée quoi que ce soit à la
+main.
+
+Le tableau de bord fourni est décrit au §5.
+
+### node-exporter et cAdvisor — les sondes
+
+- **node-exporter** mesure la machine : processeur, mémoire, disque, charge.
+- **cAdvisor** mesure chaque conteneur : processeur, mémoire, redémarrages.
+
+Les deux ensemble répondent aux deux questions qui comptent lors d'un incident :
+« la machine est-elle saturée ? » et « lequel des dix services en est la
+cause ? ».
+
+---
 
 ## 3. Les réseaux
 
-```mermaid
-flowchart LR
-  CLIENT(["Poste client"]) -->|"443"| TRAEFIK
+Deux réseaux, et la séparation entre les deux est la mesure de sécurité la plus
+efficace du projet.
 
-  subgraph edge_net["overlay **edge** — non interne"]
-    TRAEFIK["Traefik<br/>mode host"]
-    WHOAMI["whoami"]
-    GLPIW["glpi-web ×2"]
-    MINIOC["console MinIO"]
-  end
-
-  subgraph data_net["overlay **data** — interne + **IPsec**"]
-    GALERA[("Galera ×3")]
-    DBPROXY["db-proxy"]
-    CASS[("Cassandra ×3")]
-    ES[("Elasticsearch ×3")]
-    MINIO[("MinIO S3")]
-    JOBS["jobs de sauvegarde"]
-  end
-
-  subgraph mon_net["overlay **monitoring** — interne"]
-    PROM["Prometheus ×2"]
-    AM["Alertmanager ×3"]
-    GRAF["Grafana ×2"]
-    A2G["alert2glpi"]
-  end
-
-  subgraph mgmt_net["overlay **mgmt** — interne"]
-    SP["docker-socket-proxy (RO)"]
-  end
-
-  subgraph cs_net["overlay **crowdsec** — interne"]
-    LAPI["CrowdSec LAPI"]
-  end
-
-  subgraph cron_net["overlay **backup_cronjob** — interne, privé"]
-    CRON["swarm-cronjob"] --- SPRW["docker-socket-proxy-rw"]
-  end
-
-  GLPIW --> DBPROXY --> GALERA
-  TRAEFIK --> SP
-  TRAEFIK --> LAPI
-  PROM --> SP
-  PROM --> ES
-  PROM --> GALERA
-  GRAF --> GALERA
-  A2G --> GLPIW
-  JOBS --> MINIO
-  ES --> MINIO
-```
-
-| Réseau | `internal` | Chiffré | Qui y est | Pourquoi |
-|---|---|---|---|---|
-| `edge` | non | non | Traefik, whoami, glpi-web, console MinIO | le seul réseau avec une route vers l'extérieur ; c'est là qu'atterrit un attaquant qui compromet un service publié |
-| `data` | **oui** | **IPsec** | bases, MinIO, jobs de sauvegarde | le chiffrement est ce qui rend acceptable le HTTP en clair entre nœuds Elasticsearch ([ADR-0007](adr/0007-elasticsearch-logs-sans-loki.md)) |
-| `monitoring` | oui | non | Prometheus, Alertmanager, Grafana, exporters | trafic de métriques, sans donnée métier |
-| `mgmt` | oui | non | proxy Docker en lecture seule, ses clients | isole l'API Docker de tout le reste |
-| `crowdsec` | oui | non | LAPI, agents, bouncer | les décisions de bannissement ne transitent pas par `edge` |
-| `backup_cronjob` | oui | non | swarm-cronjob **et** le proxy en écriture, rien d'autre | voir §6 |
-
-Un réseau `internal` n'a **pas de passerelle par défaut** : un conteneur
-compromis sur `data` ne peut pas exfiltrer vers Internet, quoi qu'il exécute.
-
-## 4. Le chemin d'une requête
-
-```mermaid
-sequenceDiagram
-  autonumber
-  participant U as Utilisateur
-  participant K as Keepalived (VIP)
-  participant IPT as iptables DW-INPUT
-  participant T as Traefik (mode host)
-  participant CS as CrowdSec bouncer
-  participant M as Middlewares
-  participant S as glpi-web
-  participant DB as db-proxy → galera-1
-
-  U->>K: HTTPS 443 vers 192.168.56.10
-  K->>IPT: le nœud porteur reçoit le paquet
-  IPT-->>U: DROP si hors CLUSTER_CIDR pour un port non public
-  IPT->>T: 443 autorisé
-  T->>CS: cette IP est-elle bannie ? (cache stream)
-  CS-->>T: 403 si décision active
-  T->>M: chaîne : redirect, headers, rate-limit, allowlist si admin
-  M->>S: HTTP interne, IP client réelle préservée
-  S->>DB: écriture SQL — toujours vers le writer unique
-  DB-->>S: résultat
-  S-->>U: réponse, TLS terminé par Traefik
-```
-
-Deux points structurants :
-
-- **Traefik est en `mode: host`**, pas derrière le maillage de routage Swarm. Le
-  maillage fait du SNAT : l'IP réelle du client serait remplacée par une
-  passerelle `10.20.x.x`, CrowdSec bannirait le maillage plutôt que l'attaquant,
-  et les journaux d'accès deviendraient inexploitables ([ADR-0003](adr/0003-traefik-host-mode-keepalived.md)).
-- **Toutes les écritures SQL passent par `db-proxy`** vers un writer unique.
-  Galera est multi-maître, mais écrire sur les trois nœuds provoque des
-  *deadlocks* de certification que l'application voit comme des erreurs
-  aléatoires ([ADR-0005](adr/0005-mariadb-galera-haproxy.md)).
-
-## 5. Les cinq stacks
-
-Déployées dans cet ordre par `make deploy`, chacune attendue en bonne santé
-avant la suivante — GLPI ne peut pas s'installer avant que Galera n'existe.
-
-```mermaid
-flowchart LR
-  E["**edge**<br/>Traefik, CrowdSec,<br/>socket-proxy, whoami"]
-    --> D["**data**<br/>Galera ×3, db-proxy,<br/>Cassandra ×3, ES ×3,<br/>Kibana, Fluent Bit"]
-    --> A["**apps**<br/>glpi-web ×2,<br/>glpi-cron"]
-    --> M["**monitoring**<br/>Prometheus ×2, Alertmanager ×3,<br/>Grafana ×2, exporters, alert2glpi"]
-    --> B["**backup**<br/>MinIO, swarm-cronjob,<br/>11 jobs, backup-metrics"]
-  R["**registry**<br/>images maison"] -.->|"préalable à make build"| E
-  DEMO["**demo** (optionnel)<br/>demo-producer"] -.->|"charge de fond"| D
-```
-
-| Stack | Services | Fichier |
-|---|---|---|
-| `registry` | registre Docker interne | `stacks/registry.yml` |
-| `edge` | Traefik, CrowdSec (LAPI + agents), proxy Docker RO, whoami | `stacks/edge.yml` |
-| `data` | Galera ×3, db-proxy, Cassandra ×3, Elasticsearch ×3, Kibana, Fluent Bit | `stacks/data.yml` |
-| `apps` | glpi-web ×2, glpi-cron | `stacks/apps.yml` |
-| `monitoring` | Prometheus ×2, Alertmanager ×3, Grafana ×2, 5 exporters, alert2glpi | `stacks/monitoring.yml` |
-| `backup` | MinIO, swarm-cronjob, proxy Docker RW, backup-metrics, 11 jobs | `stacks/backup.yml` |
-| `demo` | demo-producer | `stacks/demo.yml` |
-
-## 6. Le socket Docker : deux fenêtres, pas une porte
-
-Monter `/var/run/docker.sock` dans un conteneur, c'est lui donner **root sur
-l'hôte** : l'API Docker permet de créer un conteneur privilégié qui monte `/`.
-Le CDC §6.4 l'interdit donc, avec exactement deux exceptions, et
-`scripts/validate-stacks.sh` échoue si une troisième apparaît.
-
-| Proxy | Écriture | Réseau | Clients | Liste blanche |
-|---|---|---|---|---|
-| `docker-socket-proxy` | **non** (`POST=0`) | `mgmt` | Traefik, Prometheus, jobs de sauvegarde | SERVICES, TASKS, NETWORKS, NODES, INFO, VERSION |
-| `docker-socket-proxy-rw` | oui | `backup_cronjob` (privé) | **swarm-cronjob seul** | SERVICES, TASKS, POST |
-
-Ce que `POST=1` accorde est réel : qui atteint le second proxy peut mettre à jour
-n'importe quel service, et une mise à jour de service peut monter la racine de
-l'hôte. C'est pour cela qu'**un seul** service l'atteint, sur un réseau que rien
-d'autre ne rejoint — et que `tests/smoke/network-isolation.sh` le vérifie sur le
-cluster vivant, pas seulement dans les fichiers.
-
-## 7. Les données : quatre magasins, quatre rôles
-
-| Magasin | Contenu | Réplication | Cohérence | Sauvegarde |
-|---|---|---|---|---|
-| **MariaDB Galera** | base GLPI, base Grafana | synchrone, 3 nœuds | RPO 0 | dump logique quotidien → restic |
-| **Cassandra** | événements capteurs (datalake) | RF=3 | `LOCAL_QUORUM` | `nodetool snapshot` → restic, par nœud |
-| **Elasticsearch** | logs + copie analytique du datalake | 1 replica par shard | RPO 0 | snapshots natifs (SLM) vers MinIO |
-| **NFS (node1)** | pièces jointes, config et plugins GLPI | **aucune** | — | restic quotidien |
-
-**Cassandra et Elasticsearch ne font pas double emploi.** La clé de partition
-Cassandra `(site, sensor_id, day)` sert la question « la série d'un capteur, un
-jour donné », en millisecondes, et **refuse** délibérément les questions
-transverses. Celles-ci vont à Elasticsearch, indexé pour cela. Les deux magasins
-sont complémentaires par conception ([ADR-0007](adr/0007-elasticsearch-logs-sans-loki.md)).
-
-## 8. La boucle alerte → ticket
-
-C'est la propriété qui distingue une plateforme supervisée d'une plateforme avec
-des graphiques.
-
-```mermaid
-flowchart LR
-  T["cible"] -->|"scrape"| P["Prometheus ×2<br/>(HA par duplication)"]
-  P -->|"règle · for:"| AM["Alertmanager ×3<br/>gossip, déduplication,<br/>9 règles d'inhibition"]
-  AM -->|"webhook"| A2G["alert2glpi"]
-  A2G -->|"API REST"| G["GLPI : ticket créé"]
-  AM -->|"résolution"| A2G
-  A2G -->|"suivi + statut Résolu"| G
-```
-
-- **Deux Prometheus identiques** qui ne se parlent pas : rien à synchroniser,
-  rien qui diverge, aucune élection à déboguer. La déduplication est faite en
-  aval par le cluster Alertmanager.
-- **`alert2glpi`** ([ADR-0009](adr/0009-alert2glpi.md)) déduplique par
-  l'empreinte (`fingerprint`) Alertmanager glissée dans le titre du ticket :
-  une alerte qui repasse en *firing* ré-ouvre **le même** ticket au lieu d'en
-  créer un second.
-- **Neuf règles d'inhibition** : un nœud perdu ne doit pas produire un ticket par
-  service qu'il hébergeait, mais un seul, `NodeDown`.
-
-## 9. Sauvegardes et reprise
-
-3-2-1 : les données vivantes, le dépôt MinIO, et un miroir horaire hors site.
-Chiffrement restic AES-256, rétention 7 j / 4 sem / 6 mois, vérification
-d'intégrité hebdomadaire, et surtout : **une métrique par job**, surveillée par
-`BackupTooOld` et `BackupFailed`.
-
-Une sauvegarde qui s'arrête en silence est pire que pas de sauvegarde — elle
-produit une confiance injustifiée. Le détail est dans
-[`04-composants/backup.md`](04-composants/backup.md) et le plan complet dans
-[`07-PRA.md`](07-PRA.md).
-
-## 10. Dimensionnement
-
-| Ressource | Par nœud | Total | Justification |
+| Réseau | Nom Docker | Sortie Internet | Qui s'y trouve |
 |---|---|---|---|
-| vCPU | 4 | 12 | trois JVM (Cassandra, Elasticsearch) plus MariaDB par nœud |
-| RAM | 6 Gio | 18 Gio | voir la répartition ci-dessous |
-| Disque | 40 Gio | 120 Gio | volumes locaux, plus le dépôt MinIO sur node3 |
+| `proxy` | `dockerwarts_proxy` | oui | Traefik et les services qu'il expose |
+| `backend` | `dockerwarts_backend` | **non** (`internal: true`) | bases, moteurs, sondes |
 
-Répartition mémoire indicative sur un nœud (profil `full`) :
+`internal: true` retire la passerelle par défaut du réseau. Un conteneur
+compromis sur `backend` **ne peut joindre aucune adresse extérieure**, quoi
+qu'il exécute : ni téléchargement d'outil, ni exfiltration de données. Ce n'est
+pas une règle de filtrage qu'on peut contourner, c'est l'absence de route.
 
-| Service | Limite | Réservation |
+MariaDB, Cassandra, node-exporter et cAdvisor sont **uniquement** sur `backend` :
+ils ne sont joignables ni depuis Internet ni depuis Traefik. GLPI, Kibana,
+Prometheus et Grafana sont sur les deux, parce qu'ils doivent à la fois être
+exposés et joindre leurs dépendances.
+
+**Aucun port de base de données n'est publié sur l'hôte.** Pas de `3306:3306`,
+pas de `9200:9200`, pas de `9042:9042`. Pour interroger MariaDB depuis la
+machine, on passe par `docker compose exec`.
+
+---
+
+## 4. Les volumes
+
+Tout ce qui doit survivre à `docker compose down` est dans un volume nommé.
+
+| Volume | Contenu | Sauvegardé par |
 |---|---|---|
-| Elasticsearch | 2 Gio | 1 Gio (heap 1 Gio) |
-| Cassandra | 2 Gio | 1 Gio (heap 1 Gio) |
-| MariaDB Galera | 1 Gio | 512 Mio |
-| Prometheus | 2 Gio | 512 Mio (sur 2 nœuds) |
-| GLPI web | 1 Gio | 256 Mio |
-| Le reste (Traefik, CrowdSec, exporters, Grafana…) | < 1 Gio cumulé | |
+| `db_data` | Base MariaDB (tickets, parc, utilisateurs) | `mariadb-dump` |
+| `glpi_files` | Documents joints aux tickets | archive tar |
+| `glpi_config` | Configuration **et clé de chiffrement** de GLPI | archive tar |
+| `glpi_plugins`, `glpi_marketplace` | Extensions installées | archive tar |
+| `es_data` | Index Elasticsearch **et** dépôt de snapshots | API snapshot, puis archive du seul sous-répertoire `snapshots/` |
+| `cassandra_data` | Données du datalake | `nodetool snapshot` |
+| `prometheus_data` | 30 jours de métriques | non sauvegardé (voir ci-dessous) |
+| `grafana_data` | Comptes et préférences Grafana | archive tar |
 
-Les limites ne sont pas décoratives : sans elles, un Elasticsearch qui gonfle
-emporte Cassandra sur le même nœud, et la panne se présente comme une panne
-Cassandra. `PROFILE=light` dans `.env` réduit les *heaps* JVM pour un poste plus
-modeste.
+> **Pourquoi `prometheus_data` n'est pas sauvegardé.** Les métriques sont des
+> données d'observation, pas des données métier : leur perte n'empêche personne
+> de travailler, et elles se reconstituent d'elles-mêmes en quelques minutes.
+> Les sauvegarder représenterait le plus gros volume du lot pour la valeur la
+> plus faible. Ce choix est assumé et documenté dans
+> [`05-PRA.md`](05-PRA.md).
 
-## 11. Choix technologiques — le fil conducteur
+> **`glpi_config` est le volume le plus important après la base.** Il contient
+> la clé de chiffrement de GLPI. Sans elle, tous les mots de passe enregistrés
+> dans l'application (LDAP, SMTP, comptes d'inventaire) sont **irrécupérables**,
+> même avec une base de données parfaitement restaurée.
 
-Tous les choix structurants sont consignés en [ADR](adr/README.md). Le fil
-commun tient en une phrase : **préférer un mécanisme qui tolère la panne à un
-mécanisme qui bascule**, et quand une bascule est inévitable, la mesurer.
+---
 
-| # | Décision | En une ligne |
-|---|---|---|
-| [0001](adr/0001-docker-swarm.md) | Docker Swarm | l'orchestrateur que trois VM justifient ; Kubernetes serait plus d'infrastructure que d'application |
-| [0002](adr/0002-vagrant-ansible.md) | Vagrant + Ansible | l'infrastructure est du code, reproductible et idempotent |
-| [0003](adr/0003-traefik-host-mode-keepalived.md) | Traefik `mode: host` + Keepalived sur l'hôte | préserver l'IP client réelle, sans quoi CrowdSec et les logs perdent leur sens |
-| [0004](adr/0004-pare-feu-quatre-couches-crowdsec.md) | Pare-feu à 4 couches | chaque couche traite ce qu'elle est seule à voir |
-| [0005](adr/0005-mariadb-galera-haproxy.md) | Galera + writer unique | la HA sans les deadlocks de certification |
-| [0006](adr/0006-nfs-spof-assume.md) | NFS, SPOF **assumé** | nommer un point de rupture vaut mieux que prétendre qu'il n'existe pas |
-| [0007](adr/0007-elasticsearch-logs-sans-loki.md) | Elasticsearch, pas Loki ; HTTP interne sans TLS | un magasin de moins, et le chiffrement là où il est réellement obtenu |
-| [0008](adr/0008-minio-restic-sauvegardes.md) | MinIO + restic + snapshots natifs | un outil universel, et les mécanismes natifs là où ils existent |
-| [0009](adr/0009-alert2glpi.md) | `alert2glpi` maison | 300 lignes testées valent mieux qu'un plugin non maintenu |
-| [0010](adr/0010-metriques-minio-public-reseau-interne.md) | Métriques MinIO en `public`, confinées | un secret qui expire en silence est pire qu'un réseau interne chiffré |
+## 5. Le tableau de bord
 
-## 12. Où aller ensuite
+Un seul tableau de bord, `Dockerwarts — vue d'ensemble`, en quatre bandeaux.
+Le parti pris est de **ne pas multiplier les écrans** : un exploitant en
+incident regarde une page, pas douze.
 
-| Question | Document |
-|---|---|
-| Comment j'installe tout ça ? | [`02-installation.md`](02-installation.md) |
-| Comment c'est protégé ? | [`03-reseau-securite.md`](03-reseau-securite.md) |
-| Comment marche le composant X ? | [`04-composants/`](04-composants/) |
-| Que surveille-t-on, et comment ? | [`05-monitoring.md`](05-monitoring.md) |
-| Qu'est-ce qui tombe si un nœud meurt ? | [`06-haute-disponibilite.md`](06-haute-disponibilite.md) |
-| Comment je restaure ? | [`07-PRA.md`](07-PRA.md) |
-| Comment j'exploite au quotidien ? | [`08-exploitation.md`](08-exploitation.md) |
+**Disponibilité** — quatre indicateurs de synthèse (cibles répondant, CPU,
+mémoire, disque) et l'historique de disponibilité de chaque source. C'est la
+première chose qu'on regarde, et souvent la seule nécessaire.
+
+**Conteneurs** — processeur et mémoire par service, part de la limite mémoire
+atteinte, et nombre de redémarrages sur 15 minutes. Ces deux derniers panneaux
+répondent aux pannes les plus discrètes : un conteneur tué par le noyau parce
+qu'il touche *sa* limite alors que la machine a de la mémoire libre, et un
+service qui redémarre en boucle en paraissant « démarré » à chaque coup d'œil.
+
+**Trafic** — requêtes par seconde, codes de réponse HTTP empilés, et temps de
+réponse médian et 95e centile. C'est la vue **côté utilisateur** : un 5xx ici
+signifie une panne réelle, même quand les dix conteneurs sont `running`. La
+médiane dit ce que vit l'utilisateur moyen, le 95e centile ce que vivent les
+plus mal servis — les deux sont nécessaires, une moyenne seule masquerait les
+deux.
+
+Les **unités et les seuils** sont explicites : pourcentages en `percent`,
+mémoire en `bytes`, débit en `reqps`, latence en `s`. Un graphe sans unité
+oblige à deviner, et on devine mal en situation d'incident.
+
+---
+
+## 6. Ce que cette architecture ne prétend pas être
+
+Honnêteté sur les limites, elles sont détaillées dans
+[`04-haute-disponibilite.md`](04-haute-disponibilite.md) :
+
+- **La machine hôte est un point de défaillance unique.** Un seul serveur,
+  donc pas de tolérance à sa panne. Les mesures de haute disponibilité mises
+  en place couvrent les pannes de *service*, pas les pannes de *machine*.
+- **Chaque moteur de données tourne en un exemplaire.** MariaDB, Elasticsearch
+  et Cassandra ne sont pas en cluster.
+- **Le certificat TLS est auto-signé.** En production, on branche Let's Encrypt.
+
+Ces limites sont des conséquences directes du choix « un seul `docker-compose.yml`
+sur une machine », qui est le périmètre demandé. La documentation indique pour
+chacune ce qu'il faudrait changer pour la lever.
