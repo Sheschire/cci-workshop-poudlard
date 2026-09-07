@@ -102,10 +102,16 @@ smoke_check_min() {
 # real SNI and Host header. That is what makes this a test of the VIP: with a
 # hosts entry, a stale DNS cache or a local override would silently point the
 # test somewhere else and it would still pass.
+#
+# `--noproxy '*'` matters more than it looks: curl honours HTTPS_PROXY from the
+# environment, so on a workstation behind a corporate proxy the smoke test
+# would interrogate the PROXY instead of the platform — and fail for a reason
+# that has nothing to do with the platform.
 # -----------------------------------------------------------------------------
 vip_curl() {
   local host=$1 path=${2:-/}; shift 2 || true
   curl -sS --max-time 15 \
+       --noproxy '*' \
        --cacert "$CA" \
        --resolve "${host}:443:${VIP}" \
        "$@" \
@@ -113,11 +119,22 @@ vip_curl() {
 }
 vip_code() {
   local host=$1 path=${2:-/}; shift 2 || true
-  curl -s --max-time 15 -o /dev/null -w '%{http_code}' \
-       --cacert "$CA" \
-       --resolve "${host}:443:${VIP}" \
-       "$@" \
-       "https://${host}${path}" 2>/dev/null || echo "000"
+  local code
+  # curl already prints `000` when it cannot connect, AND exits non-zero. A
+  # `|| echo 000` fallback would therefore APPEND to what curl printed and
+  # produce `000000`, which reads like a real status code nobody recognises.
+  # So the output is captured, and only substituted when it is empty.
+  code="$(curl -s --max-time 15 -o /dev/null -w '%{http_code}' \
+               --noproxy '*' \
+               --cacert "$CA" \
+               --resolve "${host}:443:${VIP}" \
+               "$@" \
+               "https://${host}${path}" 2>/dev/null)" || true
+  # Keep only the three-digit status. A proxy that intercepts the connection can
+  # inject its own error text into what curl writes, and a status variable that
+  # contains prose produces a report nobody can read.
+  code="$(grep -oE '[0-9]{3}$' <<<"$code" | tail -1 || true)"
+  printf '%s' "${code:-000}"
 }
 
 # =============================================================================
@@ -141,8 +158,10 @@ smoke_check "Certificat validé par la CA interne" "0" "${tls_verify:-none}"
 # HTTP must redirect, never serve. A 200 on port 80 means the redirection
 # middleware is gone and credentials could travel in clear.
 http_code="$(curl -s --max-time 10 -o /dev/null -w '%{http_code}' \
+              --noproxy '*' \
               --resolve "whoami.${DOMAIN}:80:${VIP}" \
-              "http://whoami.${DOMAIN}/" 2>/dev/null || echo "000")"
+              "http://whoami.${DOMAIN}/" 2>/dev/null)" || true
+http_code="${http_code:-000}"
 smoke_check "HTTP → HTTPS (redirection permanente)" "308" "$http_code"
 
 # =============================================================================
@@ -157,12 +176,22 @@ smoke_check "whoami répond via la VIP" "200" "$(vip_code "whoami.${DOMAIN}")"
 # would be a 10.20.x.x gateway and CrowdSec would ban the mesh instead of the
 # attacker.
 whoami_body="$(vip_curl "whoami.${DOMAIN}" / 2>/dev/null || true)"
-remote_addr="$(grep -i '^RemoteAddr:' <<<"$whoami_body" | awk '{print $2}' | cut -d: -f1)"
-if [[ "$remote_addr" =~ ^10\.20\. ]]; then
-  smoke_check "IP client réelle préservée (mode host)" "non-10.20.x" "$remote_addr"
+# `|| true` on the whole pipeline: with an empty body `grep` exits 1, and under
+# `set -e` + `pipefail` the command substitution would KILL the smoke test
+# instead of reporting the failure. Found by running it against a platform
+# whose whoami was not up.
+remote_addr="$(grep -i '^RemoteAddr:' <<<"$whoami_body" | awk '{print $2}' | cut -d: -f1 || true)"
+if [[ -z "$remote_addr" ]]; then
+  # No answer at all. Reporting "real client IP preserved ✅" here would be a
+  # false pass on an unreachable service — the worst kind, because it is silent.
+  smoke_check "IP client réelle préservée (mode host)" "une IP" "aucune réponse de whoami"
+elif [[ "$remote_addr" =~ ^10\.20\. ]]; then
+  # A 10.20.x.x address is the Swarm routing mesh gateway: the host-mode bind
+  # of ADR-0003 is not in effect, and CrowdSec would ban the mesh.
+  smoke_check "IP client réelle préservée (mode host)" "une IP hors 10.20.x" "$remote_addr"
 else
-  smoke_check "IP client réelle préservée (mode host)" "non-10.20.x" "non-10.20.x"
-  log "   RemoteAddr observé : ${remote_addr:-?}"
+  smoke_check "IP client réelle préservée (mode host)" "une IP hors 10.20.x" "une IP hors 10.20.x"
+  log "   RemoteAddr observé : ${remote_addr}"
 fi
 
 # GLPI: 200 AND the database behind it. status.php answers 200 from Apache

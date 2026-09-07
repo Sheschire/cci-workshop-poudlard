@@ -199,6 +199,7 @@ tests/chaos/run-all.sh --no-node-kill
 ## 6. Mode mono-nœud — ce qu'il ne teste pas
 
 `make single` déploie les mêmes définitions sur un Swarm à un nœud (CDC §3.2).
+Sa mise en œuvre est décrite dans [`09-test-local.md`](09-test-local.md).
 C'est un mode de développement, et il **n'est pas** une petite production :
 
 - Galera tourne seul : pas de quorum, pas de réplication synchrone ;

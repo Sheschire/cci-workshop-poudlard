@@ -26,12 +26,20 @@ make vms provision                         # 3 VM Ubuntu 24.04 + Ansible  (~15 m
 make secrets certs                         # 41 secrets + CA interne + wildcard
 make build                                 # les 4 images maison
 make deploy                                # edge → data → apps → monitoring → backup
-make smoke --no-backup                     # vérification de bout en bout via la VIP
+make smoke ARGS=--no-backup                     # vérification de bout en bout via la VIP
 make hosts | sudo tee -a /etc/hosts        # accéder depuis le navigateur
 ```
 
 Pas-à-pas complet, variables et dépannage : [`docs/02-installation.md`](docs/02-installation.md).
 `make help` liste toutes les cibles.
+
+**Pas de VM sous la main ?** La plateforme se déploie entière sur un seul poste
+avec Docker : [`docs/09-test-local.md`](docs/09-test-local.md).
+
+```bash
+make single-prepare ARGS=--fix    # prépare le poste (Swarm, réseaux, chemins hôte)
+make secrets certs build single   # puis tout le reste
+```
 
 ## Documentation
 
@@ -45,6 +53,7 @@ Pas-à-pas complet, variables et dépannage : [`docs/02-installation.md`](docs/0
 | [`docs/06-haute-disponibilite.md`](docs/06-haute-disponibilite.md) | matrice de défaillance, méthode de mesure, résultats des tests chaos |
 | [`docs/07-PRA.md`](docs/07-PRA.md) | RPO/RTO, 11 scénarios de sinistre, reconstruction complète, journal de tests |
 | [`docs/08-exploitation.md`](docs/08-exploitation.md) | 12 runbooks : nœuds, images, secrets, certificats, ES, Cassandra, CrowdSec… |
+| [`docs/09-test-local.md`](docs/09-test-local.md) | **tester le projet sur un seul poste avec Docker**, sans VM |
 | [`docs/adr/`](docs/adr/) | les 10 Architecture Decision Records |
 | [`docs/00-cahier-des-charges.md`](docs/00-cahier-des-charges.md) | le cahier des charges d'origine |
 | [`docs/PROGRESS.md`](docs/PROGRESS.md) | avancement, preuves de vérification, ce qui reste à exécuter sur les VM |

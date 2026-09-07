@@ -167,6 +167,7 @@ nfs_note="—"
 if [[ "$NODE" == "node1" ]]; then
   section "Degraded behaviour: NFS SPOF (ADR-0006)"
   glpi_code="$(curl -s --max-time 30 -o /dev/null -w '%{http_code}' \
+                 --noproxy '*' \
                  --cacert "${DW_CERTS_DIR}/ca.crt" \
                  --resolve "glpi.${DOMAIN}:443:${VIP}" \
                  "https://glpi.${DOMAIN}/status.php" 2>/dev/null || echo "000")"

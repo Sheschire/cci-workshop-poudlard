@@ -130,21 +130,24 @@ deploy-demo: ## Deploy the big-data demo producer (optional)
 status: ## Services, nodes and cluster health at a glance
 	$(SCRIPTS)/status.sh
 
-single: ## Single-node mode for a workstation (NOT highly available)
+single: single-prepare ## Single-node mode for a workstation (NOT highly available)
 	$(require_env)
 	$(SCRIPTS)/deploy.sh --single all
+
+single-prepare: ## Check that this workstation can run `make single` (--fix to repair)
+	$(SCRIPTS)/single-node-prepare.sh $(ARGS)
 
 # =============================================================================
 # Tests
 # =============================================================================
-.PHONY: smoke chaos dr-drill test-python
+.PHONY: smoke chaos dr-drill test-python single-prepare
 
-smoke: ## End-to-end validation through the VIP
-	$(TESTS)/smoke/smoke.sh
+smoke: ## End-to-end validation through the VIP (ARGS="--quick --no-backup")
+	$(TESTS)/smoke/smoke.sh $(ARGS)
 
-chaos: ## HA test campaign (kill service, drain node, kill node)
+chaos: ## HA test campaign (ARGS="--no-node-kill" from a node without Vagrant)
 	@mkdir -p $(REPORTS)
-	$(TESTS)/chaos/run-all.sh
+	$(TESTS)/chaos/run-all.sh $(ARGS)
 
 dr-drill: ## Automated disaster-recovery drill (restores, no production impact)
 	@mkdir -p $(REPORTS)

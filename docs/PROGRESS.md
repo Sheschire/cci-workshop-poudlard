@@ -614,6 +614,21 @@ make single
 > 3. **La sonde à 5 Hz** utilise `sleep 0.2`, qui suppose un `sleep` GNU. Sur
 >    macOS, installer `coreutils` ou exécuter la campagne depuis un nœud.
 
+### Mode mono-nœud — vérifié en déployant réellement
+
+Le démon Docker de la session a permis de **déployer les six stacks** sur un
+Swarm mono-nœud (seuls les *blobs* d'images restent refusés, donc aucun
+conteneur ne démarre). Cela a révélé trois défauts que `docker stack config`
+seul ne pouvait pas montrer, tous corrigés :
+
+| Défaut | Symptôme | Correction |
+|---|---|---|
+| **10 volumes NFS** montés sur un poste sans serveur NFS | GLPI, `backup-metrics` et tous les jobs de sauvegarde restent bloqués | `single-node.py` convertit les volumes NFS en volumes locaux, **en fusionnant** `backup_metrics` et `backup_metrics_ro` qui désignent le même export (sinon les jobs écrivent dans l'un et l'exporteur lit l'autre, vide pour toujours) |
+| **`/var/log/traefik` absent** (créé par Ansible sur les VM) | Swarm **rejette** Traefik, Fluent Bit et l'agent CrowdSec : `bind source path does not exist` | `scripts/single-node-prepare.sh` (cible `make single-prepare`) : diagnostique et crée les chemins, le Swarm, les réseaux ; distingue blocages et points d'attention |
+| `smoke.sh` **mourait** au lieu de rapporter | `grep` sur un corps vide + `set -e` → arrêt au milieu du test ; et la branche `else` déclarait un **succès** quand `RemoteAddr` était vide | corps vide traité comme un échec explicite ; `|| true` sur le pipeline ; statut HTTP nettoyé (`000000` → `000`) ; `--noproxy '*'` sur tous les appels à la VIP — sans quoi, derrière un proxy d'entreprise, le test interroge le proxy |
+
+Documenté dans [`09-test-local.md`](09-test-local.md).
+
 ### Phase 7
 
 La documentation est vérifiable hors VM et l'a été, à deux exceptions près, qui

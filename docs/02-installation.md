@@ -40,7 +40,7 @@ make vms provision                                     # 2. VM + hôtes + Swarm 
 make secrets certs                                     # 3. secrets et certificats
 make build                                             # 4. images maison
 make deploy                                            # 5. les 5 stacks, dans l'ordre  (~10 min)
-make smoke --no-backup                                 # 6. validation
+make smoke ARGS=--no-backup                                 # 6. validation
 make hosts | sudo tee -a /etc/hosts                    # 7. accéder depuis le navigateur
 ```
 
@@ -173,7 +173,7 @@ normal (`start_period` de 240 s sur Cassandra).
 ## 8. Étape 6 — Valider
 
 ```bash
-make smoke --no-backup     # avant la première sauvegarde
+make smoke ARGS=--no-backup     # avant la première sauvegarde
 tests/smoke/network-isolation.sh
 ```
 
@@ -220,8 +220,12 @@ chaque passage.
 
 ## 11. Mode mono-nœud (développement)
 
+> **Un document entier y est consacré** : [`09-test-local.md`](09-test-local.md)
+> — préparation du poste, les quatre variables de `.env` à changer, ce qui se
+> teste réellement en local et ce qui ne s'y teste pas.
+
 ```bash
-docker swarm init
+make single-prepare ARGS=--fix    # Swarm, réseaux overlay, chemins hôte
 make secrets certs build
 make single
 ```

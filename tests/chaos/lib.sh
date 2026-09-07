@@ -30,6 +30,7 @@ readonly CHAOS_PROBE_HOST="whoami"
 # -----------------------------------------------------------------------------
 vip_up() {
   curl -s --max-time 1 -o /dev/null \
+       --noproxy '*' \
        --cacert "$CHAOS_CA" \
        --resolve "${CHAOS_PROBE_HOST}.${DOMAIN}:443:${VIP}" \
        "https://${CHAOS_PROBE_HOST}.${DOMAIN}/" 2>/dev/null
