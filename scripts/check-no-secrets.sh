@@ -39,9 +39,19 @@ section "Credential literals in tracked files"
 # value. Placeholders (changeme, CHANGE_ME, <…>, ${…}, _FILE indirections) are
 # how the repository is meant to look.
 PATTERN='(password|passwd|secret|token|api_?key|access_?key)[[:space:]]*[:=][[:space:]]*["'"'"']?[A-Za-z0-9/+=_-]{12,}'
+# Second filter, on the VALUE side. Without it the check produces false
+# positives that are worse than useless — a scanner people learn to ignore is a
+# scanner that will be ignored on the day it is right:
+#   `= _read_secret("…")`  an assignment from a FUNCTION, not a literal. The
+#                          giveaway is the `(` that follows.
+#   `= "test-app-token"`   a fixture in a test file. Test doubles are not
+#                          credentials, and tests/ is where they belong.
+# Everything else still fails the build.
 if git grep -nEI --ignore-case "$PATTERN" -- \
       ':!*.md' ':!docs/*' ':!scripts/check-no-secrets.sh' ':!.gitignore' \
-  | grep -vEi 'changeme|change_me|example|placeholder|\$\{|\{\{|_FILE|xxxx|<[a-z_]+>|sha256:' ; then
+  | grep -vEi 'changeme|change_me|example|placeholder|\$\{|\{\{|_FILE|xxxx|<[a-z_]+>|sha256:' \
+  | grep -vE '[:=][[:space:]]*[A-Za-z_][A-Za-z0-9_.]*\(' \
+  | grep -vE '^[^:]*/tests?/' ; then
   error "a credential literal may have been committed (see above)"
   rc=1
 else

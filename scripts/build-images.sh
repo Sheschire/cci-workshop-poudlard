@@ -66,8 +66,19 @@ tag_exists() {
 
 built=0 skipped=0
 for name in "${IMAGES[@]}"; do
+  [[ -d "images/${name}" ]] || { warn "images/${name} does not exist yet — skipped"; continue; }
+
+  # Each image builds from its own directory, except backup-runner: it copies
+  # scripts/backup/*.sh into the image, and those live under scripts/ (CDC
+  # §10.1), outside any images/ subdirectory. It therefore builds from the
+  # repository root — which is exactly why the root carries a deny-by-default
+  # .dockerignore: `secrets/`, `certs/` and `.env` must never enter a build
+  # context, let alone an image layer pushed to the registry.
   context="images/${name}"
-  [[ -d "$context" ]] || { warn "${context} does not exist yet — skipped"; continue; }
+  dockerfile="images/${name}/Dockerfile"
+  if [[ "$name" == "backup-runner" ]]; then
+    context="."
+  fi
 
   ref="${REGISTRY}/dockerwarts/${name}:${IMAGE_TAG}"
   section "${name} → ${ref}"
@@ -86,6 +97,7 @@ for name in "${IMAGES[@]}"; do
     --pull \
     --provenance=false \
     --sbom=false \
+    --file "$dockerfile" \
     --tag "$ref" \
     --label "org.opencontainers.image.title=dockerwarts/${name}" \
     --label "org.opencontainers.image.version=${IMAGE_TAG}" \

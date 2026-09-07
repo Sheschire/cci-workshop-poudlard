@@ -342,4 +342,6 @@ scrape_configs:
     # 60 s and not 15 s: these metrics change a few times a day. Scraping them
     # four times a minute would only cost NFS reads.
     static_configs:
-      - targets: ["backup-metrics:80"]
+      # 8080 and not 80: the nginx runs unprivileged with cap_drop [ALL], so it
+      # cannot bind a port below 1024 (see config/backup/nginx.conf).
+      - targets: ["backup-metrics:8080"]

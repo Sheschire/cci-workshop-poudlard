@@ -122,7 +122,17 @@ for svc, spec in (doc.get("services") or {}).items():
         bad.append(f"{svc}: no deploy.restart_policy")
     if not spec.get("logging"):
         bad.append(f"{svc}: no logging driver")
-    if not spec.get("healthcheck"):
+    # A scheduled one-shot job (replicas: 0 + restart none, driven by
+    # swarm-cronjob) is *supposed* to exit. Docker would mark it unhealthy for
+    # doing exactly what it was scheduled to do, and swarm-cronjob would then
+    # refuse the next run. Its supervision is the backup_last_status metric it
+    # publishes, watched by BackupFailed — a stronger signal than a healthcheck,
+    # because it survives the container that produced it.
+    is_scheduled_job = (
+        deploy.get("replicas") == 0
+        and (deploy.get("restart_policy") or {}).get("condition") == "none"
+    )
+    if not spec.get("healthcheck") and not is_scheduled_job:
         bad.append(f"{svc}: no healthcheck")
 
     # --- CDC §6.4: container hardening ----------------------------------

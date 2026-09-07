@@ -95,7 +95,11 @@ readonly -a SECRET_SPEC=(
   "dw_minio_restic_secret:pw32"
   "dw_minio_es_key:user"
   "dw_minio_es_secret:pw32"
-  "dw_minio_prometheus_token:hex64"   # bearer token for /minio/v2/metrics
+  "dw_minio_mirror_key:user"          # read-only, for the off-site mirror job
+  "dw_minio_mirror_secret:pw32"
+  # No dw_minio_prometheus_token: MinIO does not accept an arbitrary bearer
+  # token, only a JWT derived from the root credentials, which expires and
+  # would silently take the supervision of MinIO down with it (ADR-0010).
   "dw_restic_password:pw32"           # AES-256 repository key — VAULT THIS ONE
 
   # --- Off-site mirror (optional) -------------------------------------------

@@ -358,13 +358,26 @@ services:
       CASSANDRA_BROADCAST_RPC_ADDRESS: cassandra-1
       MAX_HEAP_SIZE: "${CASSANDRA_HEAP}"
       HEAP_NEWSIZE: "${CASSANDRA_NEWSIZE}"
-      # The in-JVM Prometheus agent (images/cassandra/Dockerfile) plus JMX
-      # authentication for remote `nodetool`, used by the backup jobs.
+      # LOCAL_JMX=no opens JMX beyond 127.0.0.1, which is what lets the backup
+      # jobs run `nodetool -h cassandra-N snapshot` from their own container
+      # (CDC §9.1). It is NOT a hole: cassandra-env.sh reacts to it by turning
+      # JMX authentication ON and requiring /etc/cassandra/jmxremote.password —
+      # the file mounted below as a Docker secret — and the port is only
+      # reachable on the `data` overlay, which is internal and IPsec-encrypted.
+      #
+      # The RMI hostname is deliberately left unset: the stub then advertises
+      # the container's own overlay address, which is exactly what a client on
+      # the same overlay must dial. Pinning it to the service name would send
+      # the client to the service VIP and land it on a random member.
+      LOCAL_JMX: "no"
+      # The in-JVM Prometheus agent (images/cassandra/Dockerfile), plus the JMX
+      # access file. The password file, the port and `authenticate=true` are
+      # set by cassandra-env.sh itself once LOCAL_JMX=no; repeating them here
+      # would be worse than redundant, since cassandra-env.sh appends its own
+      # -D flags AFTER these and the last definition of a system property wins.
       JVM_OPTS: >-
         -javaagent:/opt/jmx/jmx_prometheus_javaagent.jar=7070:/etc/cassandra/jmx-exporter.yml
-        -Dcom.sun.management.jmxremote.authenticate=true
-        -Dcom.sun.management.jmxremote.password.file=/run/secrets/dw_cassandra_jmx_password
-        -Dcom.sun.management.jmxremote.access.file=/run/secrets/dw_cassandra_jmx_access
+        -Dcom.sun.management.jmxremote.access.file=/etc/cassandra/jmxremote.access
       TZ: "${TZ}"
     volumes:
       - type: volume
@@ -376,10 +389,19 @@ services:
         mode: 292
     secrets:
       - source: dw_cassandra_jmx_password
+        # Mounted at the path cassandra-env.sh hard-codes when LOCAL_JMX=no.
+        target: /etc/cassandra/jmxremote.password
+        # uid 999 = `cassandra` in the upstream image. Without it the file
+        # belongs to root and the JVM — which runs as 999 — cannot read it.
+        uid: "999"
+        gid: "999"
         # The JVM REFUSES to start if the JMX password file is group- or
         # world-readable. 0400 is not a preference, it is a requirement.
         mode: 256          # 0400
       - source: dw_cassandra_jmx_access
+        target: /etc/cassandra/jmxremote.access
+        uid: "999"
+        gid: "999"
         mode: 256
     networks:
       - data

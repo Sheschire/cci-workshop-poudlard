@@ -98,8 +98,8 @@ maison (voir ci-dessous). Le **JMX exporter javaagent** est figé à la version 
 |---|---|---|---|
 | MinIO | `minio/minio` | `RELEASE.2025-09-07T16-13-09Z` | `sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e` |
 | MinIO client (`mc`) | `minio/mc` | `RELEASE.2025-08-13T08-35-41Z` | `sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727` |
-| swarm-cronjob | `crazymax/swarm-cronjob` | `1.10.0` | `sha256:8d95f3a161838ce31f9fa23f26780ef97de84de7744da6ba37ae59b82c0516ad` |
-| backup-metrics | `nginx` | `1.29.8-alpine` | `sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de` |
+| swarm-cronjob | `crazymax/swarm-cronjob` | `1.16.0` | `sha256:cc2b298e766f5600f9d9af741fb09438e089e4a092421ed594bf0e091d599be1` |
+| backup-metrics | `nginx` | `1.31.5-alpine` | `sha256:72ba65eb42c10344912a84ff42408db7d34f2feb642204570ab8fc5ffd29f1d3` |
 
 > **Note sur MinIO.** Le dépôt `minio/minio` n'a pas publié de nouvelle *release* communautaire
 > depuis `RELEASE.2025-09-07T16-13-09Z`. L'image reste disponible, fonctionnelle et épinglable ;
@@ -116,7 +116,7 @@ maison (voir ci-dessous). Le **JMX exporter javaagent** est figé à la version 
 |---|---|---|---|
 | `dockerwarts/cassandra` | `cassandra` | `5.0.9` | `sha256:d35e159439b302146f964919904f84fd3c2cebf347272b8cb8c4368c1cf200e5` |
 | `dockerwarts/alert2glpi` | `python` | `3.12-slim` | `sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea` |
-| `dockerwarts/backup-runner` | `alpine` | `3.22.5` | `sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce` |
+| `dockerwarts/backup-runner` | `alpine` | `3.24.1` | `sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b` |
 | `dockerwarts/demo-producer` | `python` | `3.12-slim` | `sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea` |
 
 Les images maison sont poussées dans le registry interne (`${REGISTRY}/dockerwarts/<nom>:${IMAGE_TAG}`)

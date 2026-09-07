@@ -1,0 +1,28 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadOnlyBucketListing",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucket",
+        "s3:GetBucketLocation"
+      ],
+      "Resource": [
+        "arn:aws:s3:::restic",
+        "arn:aws:s3:::es-snapshots"
+      ]
+    },
+    {
+      "Sid": "ReadOnlyObjectAccess",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject"
+      ],
+      "Resource": [
+        "arn:aws:s3:::restic/*",
+        "arn:aws:s3:::es-snapshots/*"
+      ]
+    }
+  ]
+}

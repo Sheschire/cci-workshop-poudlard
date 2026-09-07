@@ -1,0 +1,29 @@
+# =============================================================================
+# Build context filter for the images built FROM THE REPOSITORY ROOT.
+#
+# Only `backup-runner` uses the root as its build context, because it has to
+# copy scripts/backup/*.sh into the image and the CDC (§10.1) puts those
+# scripts under scripts/, not under images/. Every other image has its own
+# directory as context and is unaffected by this file — Docker resolves
+# .dockerignore relative to the context directory.
+#
+# The rule is deny-by-default, and that is the point: `secrets/`, `.env`, the
+# TLS private keys under `certs/` and the whole git history all live at the
+# root. A permissive context would ship them into an image layer, push them to
+# the registry, and there is no taking that back.
+#
+# To add a file to the backup-runner image, allow-list it explicitly below.
+# =============================================================================
+
+# Deny everything…
+*
+
+# …then allow exactly what the image needs.
+!scripts/backup
+
+# Belt and braces: even if the deny-all above is ever relaxed, these must never
+# reach a build context.
+secrets/
+certs/
+.env
+.git/

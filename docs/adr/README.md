@@ -13,3 +13,4 @@ Chaque décision structurante du projet est consignée ici au format ADR (contex
 | [0007](0007-elasticsearch-logs-sans-loki.md) | Elasticsearch pour logs et données, pas de Loki ; HTTP interne sans TLS | Accepté |
 | [0008](0008-minio-restic-sauvegardes.md) | MinIO + restic + snapshots natifs pour les sauvegardes | Accepté |
 | [0009](0009-alert2glpi.md) | Service maison alert2glpi pour la boucle alerte → ticket | Accepté |
+| [0010](0010-metriques-minio-public-reseau-interne.md) | Métriques MinIO en `public` sur le réseau interne plutôt que par jeton | Accepté |

@@ -144,18 +144,36 @@ critères dynamiques listés en bas de page.
 ## Phase 5 — Backup
 
 **Livrables** : `stacks/backup.yml`, `images/backup-runner/`, `scripts/backup/`, `scripts/restore/`,
-`tests/dr/dr-drill.sh`
+`tests/dr/dr-drill.sh`, `scripts/minio-init.sh`, `scripts/backup-now.sh`,
+`config/minio/policies/`, `config/backup/nginx.conf`, ADR-0010
 
-| # | Critère d'acceptation | État |
-|---|---|---|
-| 5.1 | `make backup-now` : tous les jobs terminent en succès | ⬜ |
-| 5.2 | Métriques de sauvegarde visibles dans le dashboard « Sauvegardes » | ⬜ |
-| 5.3 | `make dr-drill` vert, rapport Markdown produit | ⬜ |
-| 5.4 | `BackupTooOld` se déclenche en simulant une métrique ancienne | ⬜ |
-| 5.5 | Snapshot ES SLM listé et en état `SUCCESS` | ⬜ |
-| 5.6 | Documentation : `minio.md`, `backup.md` | ⬜ |
+| # | Critère d'acceptation | État | Preuve |
+|---|---|---|---|
+| 5.1 | `make backup-now` : tous les jobs terminent en succès | 🖥️ | les 11 services de jobs valident (`docker stack config`), montages, secrets, contraintes de placement et labels cron vérifiés dans la **stack rendue** (job par job) ; les scripts passent shellcheck avec `-x` |
+| 5.2 | Métriques de sauvegarde visibles dans le dashboard « Sauvegardes » | ✅ (statique) | **13 assertions exécutées** sur `metric_write` : écriture, non-écrasement entre jobs, **horodatage de succès gelé en cas d'échec**, absence de série dupliquée, `# HELP`/`# TYPE` uniques ; fichier produit validé par **`promtool check metrics`**. Dashboard `dw-backup` déjà vérifié en phase 4 |
+| 5.3 | `make dr-drill` vert, rapport Markdown produit | 🖥️ | 5 étapes écrites, chacune comparant le restauré au vivant ; nettoyage depuis un *trap*. L'**extraction d'une base du dump `--all-databases`** (le point fragile du *drill*) a été **testée réellement** sur un dump synthétique : première base et base du milieu, bornées des deux côtés, aucune fuite |
+| 5.4 | `BackupTooOld` se déclenche en simulant une métrique ancienne | ✅ | test unitaire promtool déjà vert en phase 4 (`backup_last_success_timestamp` figé, alerte à 1 j 2 h 30) ; la simulation *in situ* reste listée ci-dessous |
+| 5.5 | Snapshot ES SLM listé et en état `SUCCESS` | 🖥️ | `backup-es.sh` exécute la politique, **attend** et **refuse `PARTIAL`** ; le *repository* est enregistré par `es-init.sh`, rappelé par `minio-init.sh` |
+| 5.6 | Documentation : `minio.md`, `backup.md` | ✅ | + ADR-0010 (métriques MinIO) et mise à jour de `versions.md` |
+| 5.7 | Aucun secret dans le contexte de build de `backup-runner` | ✅ | contexte matérialisé et **inspecté** : `scripts/backup/` uniquement, 51 kio ; ni `secrets/`, ni `certs/`, ni `.env`, ni `.git/` (`.dockerignore` en *deny-by-default*) |
+| 5.8 | Le socket Docker en écriture reste confiné | ✅ (statique) | `docker-socket-proxy-rw` sur un overlay privé `cronjob` (`internal`), liste blanche `SERVICES`/`TASKS`/`POST` seule, managers uniquement ; `validate-stacks.sh` interdit toujours le socket à tout autre service |
 
-**Statut de la phase** : ⬜ à faire
+**Correctifs apportés à des phases antérieures** (nécessaires pour que la phase 5 fonctionne) :
+
+- `stacks/data.yml` — `LOCAL_JMX: "no"` sur les Cassandra. Sans lui, `cassandra-env.sh` lie JMX à
+  `127.0.0.1` : `nodetool -h cassandra-N` depuis le conteneur de sauvegarde ne pouvait pas
+  fonctionner. Les secrets JMX sont désormais montés sur les chemins que `cassandra-env.sh`
+  impose (`/etc/cassandra/jmxremote.{password,access}`) avec `uid/gid 999` — sans cela la JVM,
+  qui tourne en 999, ne pouvait pas lire un fichier appartenant à root, et refusait de démarrer.
+- `config/prometheus/prometheus.yml` — cible `backup-metrics:8080` (le nginx non privilégié ne
+  peut pas se lier au port 80).
+- `scripts/validate-stacks.sh` — exception `healthcheck` pour les seuls jobs planifiés
+  (`replicas: 0` + `restart_policy: none`), avec justification écrite.
+- `scripts/init-secrets.sh` — `dw_minio_prometheus_token` retiré (ADR-0010),
+  `dw_minio_mirror_key`/`_secret` ajoutés pour le compte de miroir en lecture seule.
+
+**Statut de la phase** : ✅ **terminée** — livrables complets, critères statiques vérifiés,
+critères dynamiques listés en bas de page.
 
 ---
 
@@ -410,3 +428,89 @@ make test-python
 > session). Si un service refuse de démarrer avec une erreur d'écriture, ajouter le `tmpfs`
 > manquant plutôt que de retirer `read_only`, et consigner le chemin dans
 > `docs/04-composants/traefik.md`.
+
+### Phase 5
+
+```bash
+make build            # ajoute l'image dockerwarts/backup-runner
+make deploy-backup    # déploie la stack puis exécute scripts/minio-init.sh
+
+# 5.0 — MinIO initialisé : buckets, versioning, comptes, ISOLATION vérifiée
+#   (minio-init.sh échoue de lui-même si l'un des trois manque ; à relire dans sa sortie)
+vagrant ssh node3 -c "docker exec \$(docker ps -q -f name=backup_minio) \
+  sh -c 'export MC_HOST_l=\"http://\$(cat /run/secrets/dw_minio_root_user):\$(cat /run/secrets/dw_minio_root_password)@localhost:9000\"; \
+         mc ls l; mc admin user list l; mc version info l/restic'"
+#   attendu : 3 buckets, 3 comptes, versioning Enabled sur restic
+
+# 5.1 — tous les jobs, dans l'ordre, avec rapport Markdown
+make backup-now
+#   → reports/backup-now-<date>.md ; toute ligne ❌ est un échec de la phase
+#   un job isolé :  scripts/backup-now.sh backup-cassandra-1
+
+# 5.1bis — vérifier qu'un job Cassandra n'a PAS laissé de snapshot derrière lui
+#   (le mode de panne le plus insidieux : le disque se remplit des semaines plus tard)
+vagrant ssh node1 -c "docker exec \$(docker ps -q -f name=data_cassandra-1) \
+  nodetool listsnapshots"
+#   attendu : aucune ligne « daily »
+
+# 5.2 — les métriques arrivent bien jusqu'à Prometheus
+curl -s --cacert certs/ca.crt -u admin:$(cat secrets/dw_traefik_admin_password.txt) \
+  'https://prometheus.dockerwarts.lan/api/v1/query?query=backup_last_status' | jq -r \
+  '.data.result[] | "\(.metric.job) = \(.value[1])"'
+#   attendu : une ligne par job, toutes à 0
+#   puis, visuellement : https://grafana.dockerwarts.lan/d/dw-backup
+
+# 5.3 — exercice de reprise complet (production jamais modifiée)
+make dr-drill
+#   → reports/dr-drill-<date>.md, à recopier dans le journal de tests de docs/07-PRA.md
+#   pour inspecter les copies restaurées :  tests/dr/dr-drill.sh --keep
+#                          puis nettoyer :  tests/dr/dr-drill.sh --cleanup-only
+
+# 5.4 — BackupTooOld déclenchée en vieillissant une métrique
+vagrant ssh node1 -c "sudo sed -i \
+  's/^backup_last_success_timestamp{job=\"backup-galera\"} .*/backup_last_success_timestamp{job=\"backup-galera\"} 1700000000/' \
+  /srv/nfs/backup-metrics/backup.prom"
+#   attendre ~10 min (for: 10m), puis :
+curl -s --cacert certs/ca.crt -u admin:$(cat secrets/dw_traefik_admin_password.txt) \
+  https://alertmanager.dockerwarts.lan/api/v2/alerts | jq -r '.[].labels.alertname' | grep BackupTooOld
+#   → un ticket GLPI doit apparaître ; puis rejouer  scripts/backup-now.sh backup-galera
+
+# 5.5 — snapshot Elasticsearch SLM en état SUCCESS
+scripts/restore/restore-es.sh --list
+#   attendu : au moins une ligne SUCCESS
+vagrant ssh node1 -c "docker exec \$(docker ps -q -f name=data_es-1) sh -c \
+  'curl -s -u elastic:\$(cat /run/secrets/dw_es_elastic_password) \
+     localhost:9200/_slm/policy/daily-snapshots?human' | jq '.[].last_success'"
+
+# 5.6 — restaurations, une par une (chacune depuis le nœud qui porte le volume)
+scripts/restore/restore-galera.sh --only-db glpi --as glpi_verif   # sans risque
+vagrant ssh node1 -c 'cd /vagrant && scripts/restore/restore-glpi-files.sh --to /tmp/verif'
+vagrant ssh node3 -c 'cd /vagrant && scripts/restore/restore-crowdsec.sh'
+vagrant ssh node1 -c 'cd /vagrant && scripts/restore/restore-prometheus.sh'
+#   restore-prometheus retire puis remet le label `prometheus` de son nœud :
+#   après coup, vérifier qu'il est bien revenu
+vagrant ssh node1 -c "docker node inspect self --format '{{.Spec.Labels}}'"
+
+# 5.7 — miroir hors site (si OFFSITE_S3_* est renseigné dans .env)
+scripts/backup-now.sh offsite-mirror
+#   sans configuration, le job sort en 0 SANS publier de métrique : c'est voulu,
+#   publier un succès affirmerait qu'une copie hors site existe.
+
+# 5.8 — le proxy Docker en écriture n'est joignable que par swarm-cronjob
+vagrant ssh node1 -c "docker network inspect backup_cronjob \
+  --format '{{.Internal}} {{range .Containers}}{{println .Name}}{{end}}'"
+#   attendu : true, et uniquement swarm-cronjob + docker-socket-proxy-rw
+```
+
+> **À confirmer au premier démarrage.** Trois points n'ont pas pu être exécutés faute de pouvoir
+> télécharger les images dans la session :
+>
+> 1. **`mc ready local` comme healthcheck de MinIO** — c'est la sonde documentée par MinIO et
+>    `mc` est présent dans l'image officielle. Si le healthcheck échoue immédiatement, remplacer
+>    par `curl -f http://localhost:9000/minio/health/live` et le consigner dans `minio.md`.
+> 2. **`cqlsh` dans `backup-runner`** — il est copié depuis l'image Cassandra avec `pylib/` et
+>    `lib/`. `backup-cassandra.sh` **ne dépend pas** de sa réussite : il avertit et retombe sur le
+>    `schema.cql` que `nodetool snapshot` écrit dans chaque snapshot. Si l'avertissement apparaît,
+>    corriger le `PYTHONPATH` de l'image plutôt que le script.
+> 3. **`read_only: true` sur les jobs et sur `backup-metrics`** — si un service refuse de démarrer
+>    sur une erreur d'écriture, ajouter le `tmpfs` manquant, jamais retirer `read_only`.

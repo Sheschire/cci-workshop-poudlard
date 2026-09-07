@@ -1,0 +1,898 @@
+---
+# =============================================================================
+# Dockerwarts N°1 — backup stack (CDC §7.7, §9).
+#
+#   scripts/deploy.sh backup           (make deploy-backup)
+#
+# Contents
+#   docker-socket-proxy-rw  the ONLY write-capable window on the Docker API
+#   swarm-cronjob           the scheduler that starts the jobs
+#   minio                   the S3 repository (restic + Elasticsearch snapshots)
+#   backup-metrics          nginx serving the textfile metrics to Prometheus
+#   backup-*                ten one-shot jobs, replicas 0, started by cron
+#
+# The shape of a scheduled job in Swarm
+# -------------------------------------
+# Swarm has no Job object. A job here is a normal service with `replicas: 0`
+# and `restart_policy: none`: nothing runs until swarm-cronjob scales it to 1
+# at the scheduled minute; the container runs, exits, and Swarm leaves it at
+# 0/0 because the restart policy says not to bring it back.
+#
+# Two consequences, both deliberate:
+#   * a job has NO healthcheck — it is supposed to exit, and Docker would call
+#     that unhealthy. Its supervision is the metric it publishes, watched by
+#     BackupFailed and BackupTooOld (config/prometheus/rules/backup.yml);
+#   * `skip-running=true` on every job: a backup that overruns its next slot
+#     must not be joined by a second copy of itself competing for the same
+#     database and the same restic lock.
+#
+# Schedules are 6-field cron expressions — swarm-cronjob puts SECONDS first —
+# evaluated in UTC (TZ=UTC on the scheduler), exactly as the table of CDC §9.1
+# specifies them.
+#
+# Documented in docs/04-composants/{minio,backup}.md and docs/07-PRA.md.
+# =============================================================================
+version: "3.8"
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-restart: &default-restart
+  condition: on-failure
+  delay: 10s
+  max_attempts: 0
+
+# A scheduled job must NOT be restarted: it exits on purpose, and `on-failure`
+# would turn a failed backup into a restart loop hammering the database.
+x-job-restart: &job-restart
+  condition: none
+
+x-hardening: &hardening
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+
+# --- The job template --------------------------------------------------------
+# Everything every backup job shares. Defining it once is what guarantees that
+# ten jobs cannot drift apart on the credentials, the repository URL or the
+# metrics volume — the three things that silently break a backup system.
+x-job: &job
+  image: ${REGISTRY}/dockerwarts/backup-runner:${IMAGE_TAG}
+  <<: *hardening
+  # The image contains only tools and scripts; nothing legitimately writes to
+  # the root filesystem. /tmp is a tmpfs so the credential files the jobs write
+  # (nodetool, cqlsh) never touch a disk.
+  read_only: true
+  tmpfs:
+    - /tmp:size=128M
+  user: "10002:10002"
+  environment: &job-env
+    # `minio:9000` and not the console: the S3 API. Plain HTTP inside the
+    # `data` overlay, which is internal and IPsec-encrypted (ADR-0007) — TLS
+    # here would add certificate rotation for no threat it does not cover.
+    RESTIC_REPOSITORY: "s3:http://minio:9000/restic"
+    RESTIC_CACHE_DIR: /restic-cache
+    TZ: "UTC"
+  volumes:
+    # The metrics file, on NFS: the jobs run wherever they are pinned and
+    # backup-metrics reads from one place.
+    - type: volume
+      source: backup_metrics
+      target: /metrics
+    # restic's index cache. Without it every run re-downloads the repository
+    # index from MinIO before it can decide what is new — minutes of transfer
+    # for a backup that would otherwise take seconds.
+    - type: volume
+      source: restic_cache
+      target: /restic-cache
+  secrets: &job-secrets
+    - dw_restic_password
+    - dw_minio_restic_key
+    - dw_minio_restic_secret
+  networks:
+    - data
+  logging: *default-logging
+
+x-job-resources: &job-resources
+  limits:
+    cpus: "1.00"
+    memory: 768M
+  reservations:
+    cpus: "0.05"
+    memory: 64M
+
+services:
+
+  # ===========================================================================
+  # docker-socket-proxy-rw — the one write-capable window on the Docker API
+  #
+  # swarm-cronjob has to SCALE services, which is a POST. The read-only proxy
+  # of stacks/edge.yml refuses every POST by design, so a second proxy exists
+  # for this single consumer, and it is fenced in three ways:
+  #
+  #   1. a private overlay (`cronjob`, declared at the bottom of this file and
+  #      internal): only swarm-cronjob is attached to it. Nothing on `mgmt`,
+  #      `data` or `edge` can even open a socket to it;
+  #   2. the narrowest allow-list that still lets a scheduler work — SERVICES,
+  #      TASKS and POST. No CONTAINERS, no EXEC, no SECRETS, no SWARM;
+  #   3. managers only, because that is where the Swarm API lives at all.
+  #
+  # What POST=1 grants is real and worth stating plainly: whoever reaches this
+  # proxy can update any service, and a service update can mount the host root
+  # into a container. That is why exactly one service reaches it, on a network
+  # nothing else joins.
+  # ===========================================================================
+  docker-socket-proxy-rw:
+    image: tecnativa/docker-socket-proxy:0.3.0@sha256:9e4b9e7517a6b660f2cc903a19b257b1852d5b3344794e3ea334ff00ae677ac2
+    <<: *hardening
+    read_only: true
+    tmpfs:
+      - /var/run:size=8M
+      - /tmp:size=8M
+    environment:
+      # --- allowed ------------------------------------------------------------
+      SERVICES: "1"     # read a service's spec, then update its replica count
+      TASKS: "1"        # `skip-running` needs to see whether a task still runs
+      POST: "1"         # the whole reason this second proxy exists
+      INFO: "1"
+      VERSION: "1"
+      # --- denied -------------------------------------------------------------
+      CONTAINERS: "0"   # would expose env vars and mounts of every container
+      IMAGES: "0"
+      VOLUMES: "0"
+      NETWORKS: "0"
+      NODES: "0"
+      SECRETS: "0"      # decisive: would expose every credential
+      CONFIGS: "0"
+      SWARM: "0"        # would expose the manager join token
+      EXEC: "0"         # POST + EXEC would be a root shell on any container
+      AUTH: "0"
+      BUILD: "0"
+      COMMIT: "0"
+      DISTRIBUTION: "0"
+      PLUGINS: "0"
+      SESSION: "0"
+      SYSTEM: "0"
+      LOG_LEVEL: warning
+    volumes:
+      # The documented exception of CDC §6.4, second and last occurrence.
+      # Read-only bind: the proxy needs to talk to the socket, not to replace
+      # it. The API operations it forwards are what POST=1 controls.
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+        read_only: true
+    networks:
+      - cronjob
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:2375/_ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      mode: replicated
+      # One replica, not global: a single scheduler needs a single proxy, and
+      # every extra instance is another door on the write API.
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 64M
+        reservations:
+          cpus: "0.01"
+          memory: 16M
+      restart_policy: *default-restart
+      update_config:
+        parallelism: 1
+        order: stop-first
+        failure_action: rollback
+    logging: *default-logging
+
+  # ===========================================================================
+  # swarm-cronjob — the scheduler
+  #
+  # Watches the services carrying `swarm.cronjob.enable=true` and scales them
+  # to 1 at their scheduled time. One replica: two schedulers would start every
+  # job twice, and `skip-running` would not save us — they would race.
+  # ===========================================================================
+  swarm-cronjob:
+    image: crazymax/swarm-cronjob:1.16.0@sha256:cc2b298e766f5600f9d9af741fb09438e089e4a092421ed594bf0e091d599be1
+    <<: *hardening
+    read_only: true
+    tmpfs:
+      - /tmp:size=16M
+    environment:
+      # Through the proxy, never the socket (CDC §6.4).
+      DOCKER_HOST: "tcp://docker-socket-proxy-rw:2375"
+      LOG_LEVEL: info
+      LOG_JSON: "false"
+      # UTC, because the schedules of CDC §9.1 are given in UTC. Setting the
+      # platform timezone here would silently move every backup by one or two
+      # hours depending on the season — and the RPO with it.
+      TZ: "UTC"
+    networks:
+      - cronjob
+    healthcheck:
+      # swarm-cronjob has no HTTP endpoint. Proving the process is alive is the
+      # most a healthcheck can do here; that the schedule actually fires is
+      # what BackupTooOld verifies, at the only level that matters.
+      test: ["CMD-SHELL", "pgrep swarm-cronjob >/dev/null || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+        reservations:
+          cpus: "0.01"
+          memory: 32M
+      restart_policy: *default-restart
+      update_config:
+        parallelism: 1
+        order: stop-first     # never two schedulers at once
+        failure_action: rollback
+    logging: *default-logging
+
+  # ===========================================================================
+  # MinIO — the S3 repository
+  #
+  # One replica, pinned to the node labelled minio=true (node3). Single-node
+  # MinIO is a deliberate, documented SPOF (ADR-0008): three-way erasure coding
+  # on three VMs that already run three databases would cost more than it
+  # protects, and the real protection against losing node3 is the off-site
+  # mirror, not a second local copy.
+  #
+  # Consequence stated plainly: while node3 is down, no backup can be written
+  # and none can be read. The jobs fail, BackupFailed fires, and the PRA
+  # (docs/07-PRA.md) describes the redeployment on another node followed by a
+  # re-sync from the off-site copy.
+  # ===========================================================================
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    <<: *hardening
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      # MinIO reads the _FILE forms natively — no entrypoint wrapper needed.
+      MINIO_ROOT_USER_FILE: /run/secrets/dw_minio_root_user
+      MINIO_ROOT_PASSWORD_FILE: /run/secrets/dw_minio_root_password
+      MINIO_BROWSER_REDIRECT_URL: "https://minio.${DOMAIN}"
+      # Metrics without a bearer token, confined to the internal, encrypted
+      # `data` overlay and never routed by Traefik (ADR-0010): MinIO only
+      # accepts a JWT derived from the root credentials, which expires and
+      # would take the supervision of MinIO down with it, silently.
+      MINIO_PROMETHEUS_AUTH_TYPE: "public"
+      MINIO_UPDATE: "off"
+      TZ: "${TZ}"
+    volumes:
+      - type: volume
+        source: minio_data
+        target: /data
+    configs:
+      # The access policies, applied by scripts/minio-init.sh. Mounted rather
+      # than baked in: the source of truth is git, and the content hash rolls
+      # the service when a policy changes.
+      - source: minio_policy_restic
+        target: /etc/minio/policies/restic.json
+        mode: 292     # 0444
+      - source: minio_policy_elasticsearch
+        target: /etc/minio/policies/elasticsearch.json
+        mode: 292
+      - source: minio_policy_mirror
+        target: /etc/minio/policies/mirror.json
+        mode: 292
+    secrets:
+      - dw_minio_root_user
+      - dw_minio_root_password
+    networks:
+      - data    # S3 API: restic, Elasticsearch, the mirror job
+      - edge    # console only, published by Traefik
+    healthcheck:
+      # `mc ready local` is MinIO's own readiness probe: it reports ready only
+      # once the drives are initialised and the API accepts requests. A plain
+      # TCP check would call MinIO healthy while it is still formatting.
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    stop_grace_period: 30s
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.minio == true
+      resources:
+        limits:
+          cpus: "1.00"
+          memory: 1G
+        reservations:
+          cpus: "0.10"
+          memory: 256M
+      restart_policy: *default-restart
+      update_config:
+        parallelism: 1
+        order: stop-first     # one process, one data directory: never two
+        failure_action: rollback
+        delay: 20s
+      labels:
+        # --- Traefik: the CONSOLE only ---------------------------------------
+        # The S3 API (9000) is deliberately not routed. Publishing it would put
+        # the backup repository on the Internet-facing entry point, and nothing
+        # outside the cluster has any business writing to it.
+        traefik.enable: "true"
+        traefik.swarm.network: "edge"
+        traefik.http.routers.minio.rule: "Host(`minio.${DOMAIN}`)"
+        traefik.http.routers.minio.entrypoints: "websecure"
+        traefik.http.routers.minio.tls: "true"
+        traefik.http.routers.minio.tls.options: "modern@file"
+        traefik.http.routers.minio.middlewares: "admin-chain@file"
+        traefik.http.routers.minio.service: "minio"
+        traefik.http.services.minio.loadbalancer.server.port: "9001"
+        # --- Prometheus -------------------------------------------------------
+        prometheus.job: "minio"
+        prometheus.port: "9000"
+        prometheus.path: "/minio/v2/metrics/cluster"
+    logging: *default-logging
+
+  # ===========================================================================
+  # backup-metrics — the bridge between one-shot jobs and Prometheus
+  #
+  # Prometheus cannot scrape a container that has exited. The jobs write a
+  # textfile-format .prom onto the shared NFS directory and this nginx serves
+  # it on a stable, always-up target. See config/backup/nginx.conf for why a
+  # pushgateway was rejected.
+  # ===========================================================================
+  backup-metrics:
+    image: nginx:1.31.5-alpine@sha256:72ba65eb42c10344912a84ff42408db7d34f2feb642204570ab8fc5ffd29f1d3
+    <<: *hardening
+    read_only: true
+    tmpfs:
+      - /tmp:size=16M
+    # 65534:65534 = the owner of the NFS export (ansible/group_vars/all.yml).
+    # Unprivileged, so nginx listens on 8080 — see the config.
+    user: "65534:65534"
+    environment:
+      TZ: "${TZ}"
+    volumes:
+      # Read-only: this service publishes the metrics, it never produces them.
+      - type: volume
+        source: backup_metrics_ro
+        target: /srv/metrics
+        read_only: true
+    configs:
+      - source: backup_nginx
+        target: /etc/nginx/nginx.conf
+        mode: 292
+    networks:
+      - monitoring
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8080/healthz || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      mode: replicated
+      replicas: 1
+      resources:
+        limits:
+          cpus: "0.10"
+          memory: 32M
+        reservations:
+          cpus: "0.01"
+          memory: 8M
+      restart_policy: *default-restart
+      update_config:
+        parallelism: 1
+        order: start-first
+        failure_action: rollback
+      labels:
+        prometheus.job: "backup"
+        prometheus.port: "8080"
+    logging: *default-logging
+
+  # ===========================================================================
+  # The jobs (CDC §9.1). Order below follows the nightly timetable.
+  # ===========================================================================
+
+  # --- 01:00 — Elasticsearch: execute the SLM policy and verify the result ----
+  backup-es:
+    <<: *job
+    command: ["/opt/backup/backup-es.sh"]
+    environment:
+      <<: *job-env
+      ES_HOST: es-1
+    secrets:
+      - dw_restic_password
+      - dw_minio_restic_key
+      - dw_minio_restic_secret
+      - dw_es_elastic_password
+    deploy:
+      mode: replicated
+      replicas: 0
+      resources: *job-resources
+      restart_policy: *job-restart
+      labels:
+        swarm.cronjob.enable: "true"
+        swarm.cronjob.schedule: "0 0 1 * * *"
+        swarm.cronjob.skip-running: "true"
+
+  # --- 02:00 — Galera: logical dump of every database -------------------------
+  backup-galera:
+    <<: *job
+    command: ["/opt/backup/backup-galera.sh"]
+    environment:
+      <<: *job-env
+      DB_HOST: galera-1
+      DB_USER: backup
+    secrets:
+      - dw_restic_password
+      - dw_minio_restic_key
+      - dw_minio_restic_secret
+      - dw_mariadb_backup_password
+    deploy:
+      mode: replicated
+      replicas: 0
+      resources: *job-resources
+      restart_policy: *job-restart
+      labels:
+        swarm.cronjob.enable: "true"
+        swarm.cronjob.schedule: "0 0 2 * * *"
+        swarm.cronjob.skip-running: "true"
+
+  # --- 02:30 — GLPI shared files ----------------------------------------------
+  backup-glpi-files:
+    <<: *job
+    command: ["/opt/backup/backup-glpi-files.sh"]
+    volumes:
+      - type: volume
+        source: backup_metrics
+        target: /metrics
+      - type: volume
+        source: restic_cache
+        target: /restic-cache
+      # The four GLPI exports, read-only, under one root so a single
+      # `restic backup /data` covers them all.
+      - type: volume
+        source: glpi_files
+        target: /data/files
+        read_only: true
+      - type: volume
+        source: glpi_config
+        target: /data/config
+        read_only: true
+      - type: volume
+        source: glpi_plugins
+        target: /data/plugins
+        read_only: true
+      - type: volume
+        source: glpi_marketplace
+        target: /data/marketplace
+        read_only: true
+    deploy:
+      mode: replicated
+      replicas: 0
+      resources: *job-resources
+      restart_policy: *job-restart
+      labels:
+        swarm.cronjob.enable: "true"
+        swarm.cronjob.schedule: "0 30 2 * * *"
+        swarm.cronjob.skip-running: "true"
+
+  # --- 03:00 — Cassandra, one job per member ----------------------------------
+  # Each job is pinned to the node of its member and mounts that member's
+  # volume read-only. `nodetool snapshot` freezes the SSTables of ONE node, so
+  # a single job would archive one third of the ring.
+  backup-cassandra-1: &backup-cassandra
+    <<: *job
+    command: ["/opt/backup/backup-cassandra.sh", "1"]
+    environment: &backup-cassandra-env
+      <<: *job-env
+      KEYSPACE: datalake
+    secrets: &backup-cassandra-secrets
+      - dw_restic_password
+      - dw_minio_restic_key
+      - dw_minio_restic_secret
+      - dw_cassandra_admin_password
+      - dw_cassandra_backup_password
+    volumes:
+      - type: volume
+        source: backup_metrics
+        target: /metrics
+      - type: volume
+        source: restic_cache
+        target: /restic-cache
+      - type: volume
+        source: cassandra_data_1
+        target: /cassandra
+        read_only: true
+    deploy: &backup-cassandra-deploy
+      mode: replicated
+      replicas: 0
+      placement:
+        constraints:
+          - node.labels.cassandra == 1
+      resources: *job-resources
+      restart_policy: *job-restart
+      labels:
+        swarm.cronjob.enable: "true"
+        swarm.cronjob.schedule: "0 0 3 * * *"
+        swarm.cronjob.skip-running: "true"
+
+  backup-cassandra-2:
+    <<: *backup-cassandra
+    command: ["/opt/backup/backup-cassandra.sh", "2"]
+    volumes:
+      - type: volume
+        source: backup_metrics
+        target: /metrics
+      - type: volume
+        source: restic_cache
+        target: /restic-cache
+      - type: volume
+        source: cassandra_data_2
+        target: /cassandra
+        read_only: true
+    deploy:
+      <<: *backup-cassandra-deploy
+      placement:
+        constraints:
+          - node.labels.cassandra == 2
+
+  backup-cassandra-3:
+    <<: *backup-cassandra
+    command: ["/opt/backup/backup-cassandra.sh", "3"]
+    volumes:
+      - type: volume
+        source: backup_metrics
+        target: /metrics
+      - type: volume
+        source: restic_cache
+        target: /restic-cache
+      - type: volume
+        source: cassandra_data_3
+        target: /cassandra
+        read_only: true
+    deploy:
+      <<: *backup-cassandra-deploy
+      placement:
+        constraints:
+          - node.labels.cassandra == 3
+
+  # --- Sunday 04:00 — Prometheus TSDB (instance A) ----------------------------
+  backup-prometheus:
+    <<: *job
+    command: ["/opt/backup/backup-prometheus.sh"]
+    environment:
+      <<: *job-env
+      PROM_SERVICE: monitoring_prometheus
+      PROM_NETWORK: monitoring
+    volumes:
+      - type: volume
+        source: backup_metrics
+        target: /metrics
+      - type: volume
+        source: restic_cache
+        target: /restic-cache
+      # Read-WRITE, and only here: the job must delete the TSDB snapshot it
+      # asked Prometheus to create. Prometheus never removes its own, and a
+      # forgotten snapshot pins blocks that retention would otherwise drop.
+      - type: volume
+        source: prometheus_data
+        target: /prometheus
+    networks:
+      - data          # MinIO
+      - monitoring    # the Prometheus instance itself
+      - mgmt          # the read-only socket proxy, to find the LOCAL instance
+    deploy:
+      mode: replicated
+      replicas: 0
+      placement:
+        constraints:
+          # Instance A, i.e. the node whose volume this job mounts.
+          - node.labels.prometheus == a
+      resources: *job-resources
+      restart_policy: *job-restart
+      labels:
+        swarm.cronjob.enable: "true"
+        # Sunday 04:00 UTC. Weekly: CDC §9.4 accepts a 7-day RPO on metrics,
+        # and the configuration that takes real time to rebuild is in git.
+        swarm.cronjob.schedule: "0 0 4 * * 0"
+        swarm.cronjob.skip-running: "true"
+
+  # --- 04:30 — CrowdSec LAPI database -----------------------------------------
+  backup-crowdsec:
+    <<: *job
+    command: ["/opt/backup/backup-crowdsec.sh"]
+    volumes:
+      - type: volume
+        source: backup_metrics
+        target: /metrics
+      - type: volume
+        source: restic_cache
+        target: /restic-cache
+      - type: volume
+        source: crowdsec_data
+        target: /crowdsec
+        read_only: true
+    deploy:
+      mode: replicated
+      replicas: 0
+      placement:
+        constraints:
+          # The LAPI, and therefore its database, lives on node3.
+          - node.labels.crowdsec_lapi == true
+      resources: *job-resources
+      restart_policy: *job-restart
+      labels:
+        swarm.cronjob.enable: "true"
+        swarm.cronjob.schedule: "0 30 4 * * *"
+        swarm.cronjob.skip-running: "true"
+
+  # --- 05:00 — The state of the cluster itself --------------------------------
+  backup-configs:
+    <<: *job
+    command: ["/opt/backup/backup-configs.sh"]
+    environment:
+      <<: *job-env
+      ES_HOST: es-1
+    secrets:
+      - dw_restic_password
+      - dw_minio_restic_key
+      - dw_minio_restic_secret
+      - dw_es_elastic_password
+    networks:
+      - data    # MinIO and Elasticsearch
+      - mgmt    # the READ-ONLY socket proxy
+    deploy:
+      mode: replicated
+      replicas: 0
+      resources: *job-resources
+      restart_policy: *job-restart
+      labels:
+        swarm.cronjob.enable: "true"
+        swarm.cronjob.schedule: "0 0 5 * * *"
+        swarm.cronjob.skip-running: "true"
+
+  # --- Sunday 05:00 — Cassandra anti-entropy repair ---------------------------
+  # Not a backup: the weekly repair that stops deleted rows from being
+  # resurrected by a stale replica once gc_grace_seconds expires. Scheduled
+  # here because it has the same failure mode as a backup — it silently stops
+  # happening — and the same supervision answers for it.
+  maint-cassandra-repair:
+    <<: *job
+    command: ["/opt/backup/maint-cassandra-repair.sh"]
+    environment:
+      <<: *backup-cassandra-env
+    secrets: *backup-cassandra-secrets
+    deploy:
+      mode: replicated
+      replicas: 0
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 512M
+        reservations:
+          cpus: "0.05"
+          memory: 64M
+      restart_policy: *job-restart
+      labels:
+        swarm.cronjob.enable: "true"
+        swarm.cronjob.schedule: "0 0 5 * * 0"
+        # Decisive here: a repair can run for hours on a loaded cluster, and
+        # two overlapping repairs on the same ranges would be an availability
+        # incident caused by the maintenance job.
+        swarm.cronjob.skip-running: "true"
+
+  # --- 06:00 — Retention, prune, and the weekly integrity check ---------------
+  restic-forget:
+    <<: *job
+    command: ["/opt/backup/restic-forget.sh"]
+    deploy:
+      mode: replicated
+      replicas: 0
+      resources:
+        # A prune rewrites index and pack files: it needs more memory than a
+        # backup, and more time.
+        limits:
+          cpus: "1.00"
+          memory: 1G
+        reservations:
+          cpus: "0.05"
+          memory: 128M
+      restart_policy: *job-restart
+      labels:
+        swarm.cronjob.enable: "true"
+        # After every producer of the night (06:00): pruning while a backup is
+        # still writing would fight over the repository lock.
+        swarm.cronjob.schedule: "0 0 6 * * *"
+        swarm.cronjob.skip-running: "true"
+
+  # --- Hourly — the off-site copy, the "1" of 3-2-1 ---------------------------
+  offsite-mirror:
+    <<: *job
+    command: ["/opt/backup/offsite-mirror.sh"]
+    environment:
+      <<: *job-env
+      OFFSITE_S3_ENDPOINT: "${OFFSITE_S3_ENDPOINT}"
+      OFFSITE_S3_BUCKET: "${OFFSITE_S3_BUCKET}"
+    secrets:
+      # The mirror reads with the `mirror` account, which is read-only on both
+      # buckets by policy: a mirror job that can write to what it mirrors is a
+      # ransomware amplifier.
+      - dw_minio_mirror_key
+      - dw_minio_mirror_secret
+      - dw_offsite_s3_key
+      - dw_offsite_s3_secret
+    deploy:
+      mode: replicated
+      replicas: 0
+      resources: *job-resources
+      restart_policy: *job-restart
+      labels:
+        swarm.cronjob.enable: "true"
+        # Every hour on the hour. Frequent on purpose: this is the only copy
+        # that survives the loss of node3, and an hourly mirror bounds that
+        # exposure to an hour rather than a day.
+        swarm.cronjob.schedule: "0 0 * * * *"
+        swarm.cronjob.skip-running: "true"
+
+# =============================================================================
+configs:
+  backup_nginx:
+    name: "backup_nginx-${CONFIG_HASH_NGINX_METRICS}"
+    file: ../config/backup/nginx.conf
+  # One config object per policy file, all three hashed together: editing any
+  # of them rolls MinIO, and scripts/minio-init.sh re-applies the set.
+  minio_policy_restic:
+    name: "minio_policy_restic-${CONFIG_HASH_MINIO_POLICIES}"
+    file: ../config/minio/policies/restic.json
+  minio_policy_elasticsearch:
+    name: "minio_policy_elasticsearch-${CONFIG_HASH_MINIO_POLICIES}"
+    file: ../config/minio/policies/elasticsearch.json
+  minio_policy_mirror:
+    name: "minio_policy_mirror-${CONFIG_HASH_MINIO_POLICIES}"
+    file: ../config/minio/policies/mirror.json
+
+secrets:
+  dw_restic_password:
+    external: true
+  dw_minio_root_user:
+    external: true
+  dw_minio_root_password:
+    external: true
+  dw_minio_restic_key:
+    external: true
+  dw_minio_restic_secret:
+    external: true
+  dw_minio_mirror_key:
+    external: true
+  dw_minio_mirror_secret:
+    external: true
+  dw_offsite_s3_key:
+    external: true
+  dw_offsite_s3_secret:
+    external: true
+  dw_mariadb_backup_password:
+    external: true
+  dw_cassandra_admin_password:
+    external: true
+  dw_cassandra_backup_password:
+    external: true
+  dw_es_elastic_password:
+    external: true
+
+# =============================================================================
+# Volumes
+#
+# Three kinds, and the difference matters:
+#
+#   local        MinIO's data and the restic cache: node-local, by design.
+#   NFS          the metrics file (written from three nodes, read from one)
+#                and the GLPI exports.
+#   external     the volumes of OTHER stacks, mounted read-only so a job can
+#                archive them. Swarm namespaces a stack's volumes with the
+#                stack name, hence `data_cassandra_data_1` and friends: naming
+#                them here without `external: true` would silently create
+#                three EMPTY volumes and back up nothing, successfully.
+# =============================================================================
+volumes:
+  minio_data:
+    driver: local
+
+  restic_cache:
+    driver: local
+
+  # Read-write for the jobs.
+  backup_metrics:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: "addr=${NFS_SERVER},rw,nfsvers=4.1,soft,timeo=50,retrans=3,noatime"
+      device: ":/srv/nfs/backup-metrics"
+  # The same export, mounted read-only for the nginx that serves it. A separate
+  # volume definition rather than `read_only: true` alone, so the mount itself
+  # is read-only at the NFS level: the process that publishes the metrics can
+  # never alter them.
+  backup_metrics_ro:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: "addr=${NFS_SERVER},ro,nfsvers=4.1,soft,timeo=50,retrans=3,noatime"
+      device: ":/srv/nfs/backup-metrics"
+
+  glpi_files:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: "addr=${NFS_SERVER},ro,nfsvers=4.1,soft,timeo=50,retrans=3,noatime"
+      device: ":/srv/nfs/glpi/files"
+  glpi_config:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: "addr=${NFS_SERVER},ro,nfsvers=4.1,soft,timeo=50,retrans=3,noatime"
+      device: ":/srv/nfs/glpi/config"
+  glpi_plugins:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: "addr=${NFS_SERVER},ro,nfsvers=4.1,soft,timeo=50,retrans=3,noatime"
+      device: ":/srv/nfs/glpi/plugins"
+  glpi_marketplace:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: "addr=${NFS_SERVER},ro,nfsvers=4.1,soft,timeo=50,retrans=3,noatime"
+      device: ":/srv/nfs/glpi/marketplace"
+
+  cassandra_data_1:
+    external: true
+    name: data_cassandra_data_1
+  cassandra_data_2:
+    external: true
+    name: data_cassandra_data_2
+  cassandra_data_3:
+    external: true
+    name: data_cassandra_data_3
+  prometheus_data:
+    external: true
+    name: monitoring_prometheus_data
+  crowdsec_data:
+    external: true
+    name: edge_crowdsec_data
+
+networks:
+  data:
+    external: true
+  monitoring:
+    external: true
+  mgmt:
+    external: true
+  edge:
+    external: true
+  # NOT external, and not created by Ansible: a private overlay whose only two
+  # members are swarm-cronjob and the write-capable socket proxy. Declaring it
+  # here is what keeps it that way — a service in another stack cannot attach
+  # to a network it cannot name.
+  cronjob:
+    driver: overlay
+    internal: true
+    attachable: false
