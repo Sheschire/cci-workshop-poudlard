@@ -1,0 +1,320 @@
+---
+# =============================================================================
+# Dockerwarts N°1 — applications stack: GLPI (CDC §7.5).
+#
+#   scripts/deploy.sh apps             (make deploy-apps)
+#
+# Contents
+#   glpi-web    2 replicas, one per node, behind Traefik with a sticky cookie
+#   glpi-cron   1 replica, the SINGLE executor of GLPI's automatic actions
+#
+# Shared state
+# ------------
+# GLPI keeps two kinds of state: its database (Galera, replicated) and its
+# FILES — attachments, configuration, plugins, marketplace. With two web
+# replicas on two different nodes, those files must be shared, and that is the
+# platform's only need for a shared filesystem: NFS from node1 (ADR-0006).
+#
+# The SPOF is explicit and covered by the PRA: daily restic backup of the
+# directory, a documented failover of the export to another node (RTO 30 min),
+# and a NodeDown alert that opens a GLPI ticket.
+#
+# Documented in docs/04-composants/glpi.md.
+# =============================================================================
+version: "3.8"
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-restart: &default-restart
+  condition: on-failure
+  delay: 10s
+  max_attempts: 0
+
+x-hardening: &hardening
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+
+# Every GLPI service shares the same database and secret wiring; defining it
+# once means glpi-web and glpi-cron can never drift apart.
+x-glpi-env: &glpi-env
+  # Through db-proxy, never directly at a Galera member: writes must all land
+  # on the same node (ADR-0005).
+  GLPI_DB_HOST: db-proxy
+  GLPI_DB_PORT: "3306"
+  GLPI_DB_NAME: glpi
+  GLPI_DB_USER: glpi
+  GLPI_DB_PASSWORD_FILE: /run/secrets/dw_mariadb_glpi_password
+  # The image reads the password from the environment; the generic bridge
+  # (config/common/secrets-entrypoint.sh) turns the _FILE form into it.
+  TZ: "${TZ}"
+  # GLPI is behind a TLS-terminating proxy: without this it builds http:// URLs
+  # and the browser blocks them as mixed content.
+  GLPI_URL: "https://glpi.${DOMAIN}"
+
+services:
+
+  # ===========================================================================
+  # glpi-web — the user-facing service
+  #
+  # 2 replicas, `max_replicas_per_node: 1`: losing a node leaves one serving
+  # replica and Swarm reschedules the other (~30 s, CDC §8.1).
+  # ===========================================================================
+  glpi-web:
+    image: glpi/glpi:10.0.26@sha256:ecb63fd74a97bfe267b97cea0b8482ea5cb1a1d9540a5101f7cccb4fa50b16f9
+    <<: *hardening
+    entrypoint:
+      - /usr/local/bin/secrets-entrypoint.sh
+      - /opt/entrypoint.sh
+    environment:
+      <<: *glpi-env
+      # Disable the image's own cron loop: exactly one executor must run, and
+      # that is the glpi-cron service. Two concurrent executors process the
+      # same queued actions twice — duplicate notifications, double inventory.
+      GLPI_CRON_ENABLED: "false"
+    volumes:
+      # --- NFS-backed shared state (ADR-0006) --------------------------------
+      # `soft` and not `hard`: with `hard`, an NFS outage blocks the process in
+      # uninterruptible sleep — the container cannot even be killed. With
+      # `soft`, the I/O fails, GLPI returns an error for the attachment, and
+      # the rest of the application keeps working. Degraded beats frozen.
+      # `timeo=50` (5 s) + `retrans=3` bounds that failure to ~15 s.
+      - type: volume
+        source: glpi_files
+        target: /var/www/glpi/files
+      - type: volume
+        source: glpi_config
+        target: /var/www/glpi/config
+      - type: volume
+        source: glpi_plugins
+        target: /var/www/glpi/plugins
+      - type: volume
+        source: glpi_marketplace
+        target: /var/www/glpi/marketplace
+    configs:
+      - source: secrets_entrypoint
+        target: /usr/local/bin/secrets-entrypoint.sh
+        mode: 365
+      - source: glpi_php_ini
+        target: /usr/local/etc/php/conf.d/zz-dockerwarts.ini
+        mode: 292
+    secrets:
+      - dw_mariadb_glpi_password
+    networks:
+      - edge    # Traefik routes to it
+      - data    # reaches db-proxy
+    healthcheck:
+      # The GLPI status endpoint answers 200 with "GLPI_OK" only when the
+      # database connection works too — a plain "/" would return 200 from
+      # Apache alone, hiding a broken database.
+      test: ["CMD-SHELL", "curl -sf http://localhost/status.php | grep -q 'GLPI_OK' || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    stop_grace_period: 30s
+    deploy:
+      mode: replicated
+      replicas: 2
+      placement:
+        max_replicas_per_node: 1
+      resources:
+        limits:
+          cpus: "1.00"
+          memory: 1G
+        reservations:
+          cpus: "0.10"
+          memory: 256M
+      restart_policy: *default-restart
+      update_config:
+        parallelism: 1
+        order: start-first     # stateless front end: no downtime on update
+        failure_action: rollback
+        delay: 20s
+      labels:
+        traefik.enable: "true"
+        traefik.swarm.network: "edge"
+        traefik.http.routers.glpi.rule: "Host(`glpi.${DOMAIN}`)"
+        traefik.http.routers.glpi.entrypoints: "websecure"
+        traefik.http.routers.glpi.tls: "true"
+        traefik.http.routers.glpi.tls.options: "modern@file"
+        # rate-limit only: GLPI is the one PUBLIC application, it authenticates
+        # its own users and must not be behind an IP allowlist.
+        traefik.http.routers.glpi.middlewares: "app-chain@file"
+        traefik.http.routers.glpi.service: "glpi"
+        traefik.http.services.glpi.loadbalancer.server.port: "80"
+        # --- Sticky sessions ---------------------------------------------------
+        # GLPI stores PHP sessions on the local filesystem of each replica, NOT
+        # in the database. Without stickiness a user would be logged out on
+        # roughly every other request. The cookie is `secure` + `httponly`:
+        # it only travels over HTTPS and JavaScript cannot read it.
+        traefik.http.services.glpi.loadbalancer.sticky.cookie: "true"
+        traefik.http.services.glpi.loadbalancer.sticky.cookie.name: "glpi_srv"
+        traefik.http.services.glpi.loadbalancer.sticky.cookie.secure: "true"
+        traefik.http.services.glpi.loadbalancer.sticky.cookie.httponly: "true"
+        traefik.http.services.glpi.loadbalancer.sticky.cookie.samesite: "lax"
+        # Health-aware load balancing: Traefik stops sending to a replica whose
+        # status.php fails, instead of waiting for the Swarm healthcheck.
+        traefik.http.services.glpi.loadbalancer.healthcheck.path: "/status.php"
+        traefik.http.services.glpi.loadbalancer.healthcheck.interval: "15s"
+        traefik.http.services.glpi.loadbalancer.healthcheck.timeout: "5s"
+    logging: *default-logging
+
+  # ===========================================================================
+  # glpi-cron — the single executor of GLPI's automatic actions
+  #
+  # GLPI runs queued work (notifications, inventory, purges, ticket escalation)
+  # through `glpi:cron`. It MUST have exactly one executor: two would process
+  # the same queue twice, sending duplicate notifications and corrupting
+  # counters.
+  #
+  # 1 floating replica, so Swarm reschedules it on node loss (~30 s). It serves
+  # no HTTP and is on no public network.
+  # ===========================================================================
+  glpi-cron:
+    image: glpi/glpi:10.0.26@sha256:ecb63fd74a97bfe267b97cea0b8482ea5cb1a1d9540a5101f7cccb4fa50b16f9
+    <<: *hardening
+    entrypoint:
+      - /usr/local/bin/secrets-entrypoint.sh
+      - /bin/sh
+      - -c
+      # A loop rather than a container that exits: swarm-cronjob drives the
+      # BACKUP jobs, but GLPI's cron must run every minute, which would mean a
+      # container start per minute — far more expensive than one long-lived
+      # process. `--force` runs the due actions and returns immediately.
+      - |
+        set -eu
+        echo "[glpi-cron] waiting for the GLPI installation to complete"
+        until php /var/www/glpi/bin/console --no-interaction database:check 2>/dev/null; do
+          echo "[glpi-cron] database not ready yet, retrying in 15 s"
+          sleep 15
+        done
+        echo "[glpi-cron] starting the cron loop (every 60 s)"
+        while true; do
+          php /var/www/glpi/bin/console --no-interaction glpi:cron --force || \
+            echo "[glpi-cron] cron run failed, will retry"
+          sleep 60
+        done
+    environment:
+      <<: *glpi-env
+      GLPI_CRON_ENABLED: "false"   # this service IS the cron; no nested loop
+    volumes:
+      # The same NFS state: cron writes to files/ (generated documents, logs).
+      - type: volume
+        source: glpi_files
+        target: /var/www/glpi/files
+      - type: volume
+        source: glpi_config
+        target: /var/www/glpi/config
+      - type: volume
+        source: glpi_plugins
+        target: /var/www/glpi/plugins
+      - type: volume
+        source: glpi_marketplace
+        target: /var/www/glpi/marketplace
+    configs:
+      - source: secrets_entrypoint
+        target: /usr/local/bin/secrets-entrypoint.sh
+        mode: 365
+      - source: glpi_php_ini
+        target: /usr/local/etc/php/conf.d/zz-dockerwarts.ini
+        mode: 292
+    secrets:
+      - dw_mariadb_glpi_password
+    networks:
+      - data
+    healthcheck:
+      # Proves the CLI works AND the database answers — the two things this
+      # service needs. There is no HTTP endpoint to probe.
+      test:
+        - CMD-SHELL
+        - "php /var/www/glpi/bin/console --no-interaction database:check >/dev/null 2>&1 || exit 1"
+      interval: 60s
+      timeout: 30s
+      retries: 3
+      start_period: 180s
+    stop_grace_period: 70s
+    # Slightly longer than the 60 s sleep: a SIGTERM arriving mid-sleep lets
+    # the loop finish rather than being killed in the middle of a cron run.
+    deploy:
+      mode: replicated
+      replicas: 1
+      resources:
+        limits:
+          cpus: "0.75"
+          memory: 768M
+        reservations:
+          cpus: "0.05"
+          memory: 128M
+      restart_policy: *default-restart
+      update_config:
+        parallelism: 1
+        order: stop-first     # exactly one executor, never two at once
+        failure_action: rollback
+    logging: *default-logging
+
+configs:
+  secrets_entrypoint:
+    name: "secrets_entrypoint-${CONFIG_HASH_SECRETS_ENTRYPOINT}"
+    file: ../config/common/secrets-entrypoint.sh
+  glpi_php_ini:
+    name: "glpi_php_ini-${CONFIG_HASH_GLPI_PHP}"
+    file: ../config/glpi/php.ini
+
+secrets:
+  dw_mariadb_glpi_password:
+    external: true
+
+# =============================================================================
+# Volumes — NFS, and NFS only here (ADR-0006)
+#
+# The `local` driver with `type: nfs` makes the DOCKER DAEMON perform the
+# mount, at the moment it needs it. No host fstab entry, so moving the export
+# is a matter of changing NFS_SERVER in .env and redeploying — which is exactly
+# the PRA failover procedure.
+#
+# Mount options, each one deliberate:
+#   nfsvers=4.1  no rpcbind, no separate lock daemon: one port (2049) to filter
+#   soft         an outage FAILS the I/O instead of blocking the process
+#                forever in uninterruptible sleep (see glpi-web above)
+#   timeo=50     5 s per attempt (deciseconds)
+#   retrans=3    ~15 s before giving up — bounded, not infinite
+#   noatime      GLPI reads attachments constantly; writing an access time on
+#                every read would be pure NFS round trips for nothing
+# =============================================================================
+volumes:
+  glpi_files:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: "addr=${NFS_SERVER},rw,nfsvers=4.1,soft,timeo=50,retrans=3,noatime"
+      device: ":/srv/nfs/glpi/files"
+  glpi_config:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: "addr=${NFS_SERVER},rw,nfsvers=4.1,soft,timeo=50,retrans=3,noatime"
+      device: ":/srv/nfs/glpi/config"
+  glpi_plugins:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: "addr=${NFS_SERVER},rw,nfsvers=4.1,soft,timeo=50,retrans=3,noatime"
+      device: ":/srv/nfs/glpi/plugins"
+  glpi_marketplace:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: "addr=${NFS_SERVER},rw,nfsvers=4.1,soft,timeo=50,retrans=3,noatime"
+      device: ":/srv/nfs/glpi/marketplace"
+
+networks:
+  edge:
+    external: true
+  data:
+    external: true

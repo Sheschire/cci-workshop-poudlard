@@ -47,6 +47,7 @@ TRAEFIK_DYNAMIC    .rendered/traefik-dynamic.yml
 CROWDSEC_ACQUIS    config/crowdsec/acquis.yaml
 CROWDSEC_PROFILES  config/crowdsec/profiles.yaml
 GALERA_ENTRYPOINT  config/galera/entrypoint.sh
+GLPI_PHP           config/glpi/php.ini
 GALERA_CNF         config/galera/galera.cnf
 GALERA_INIT        config/galera/init.sql
 HAPROXY            .rendered/haproxy.cfg

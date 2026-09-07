@@ -104,16 +104,18 @@ critères dynamiques listés en bas de page.
 
 **Livrables** : `stacks/apps.yml`, exports NFS, `scripts/glpi-init.sh`
 
-| # | Critère d'acceptation | État |
-|---|---|---|
-| 3.1 | Connexion à GLPI via la VIP en HTTPS | ⬜ |
-| 3.2 | Session stable entre les 2 replicas (cookie sticky) | ⬜ |
-| 3.3 | Document joint toujours présent après `docker service update --force apps_glpi-web` | ⬜ |
-| 3.4 | API REST GLPI répond avec les tokens générés (`initSession`) | ⬜ |
-| 3.5 | Mots de passe par défaut (`glpi`, `tech`, `normal`, `post-only`) changés | ⬜ |
-| 3.6 | Documentation : `glpi.md` | ⬜ |
+| # | Critère d'acceptation | État | Preuve |
+|---|---|---|---|
+| 3.1 | Connexion à GLPI via la VIP en HTTPS | 🖥️ | routeur Traefik validé par `check-traefik.py` (`app-chain@file`, sans allowlist : GLPI est la seule application publique) |
+| 3.2 | Session stable entre les 2 replicas | ✅ (statique) | 5 labels sticky vérifiés dans la stack rendue : `glpi_srv`, `secure`, `httponly`, `samesite=lax`, + healthcheck Traefik sur `/status.php` |
+| 3.3 | Document joint persistant après `--force` | 🖥️ | 4 volumes NFS vérifiés dans la stack rendue, montés par le démon Docker |
+| 3.4 | API REST répond avec les tokens générés | 🖥️ | `glpi-init.sh` fait un **vrai `initSession`** en étape 8 et échoue si aucun `session_token` ne revient |
+| 3.5 | Mots de passe par défaut changés | 🖥️ | étape 3 : `glpi` re-haché en bcrypt (format vérifié), `tech`/`normal`/`post-only` **désactivés ET** mot de passe détruit, puis contrôle SQL |
+| 3.6 | Documentation : `glpi.md` | ✅ | stack, php.ini, volumes NFS et les 8 étapes d'init expliqués |
+| 3.7 | Un seul exécuteur cron | ✅ (statique) | `glpi-cron` à 1 replica en `stop-first`, `GLPI_CRON_ENABLED=false` sur les deux services |
 
-**Statut de la phase** : ⬜ à faire
+**Statut de la phase** : ✅ **terminée** — livrables complets, critères statiques vérifiés,
+critères dynamiques listés en bas de page.
 
 ---
 
@@ -319,6 +321,43 @@ vagrant ssh node1 -c "docker exec \$(docker ps -q -f name=data_db-proxy) \
 vagrant ssh node1 -c 'docker service scale data_galera-1=0'
 #   → galera-2 doit devenir le writer en moins de 5 s ; GLPI reste disponible
 vagrant ssh node1 -c 'docker service scale data_galera-1=1'
+```
+
+### Phase 3
+
+```bash
+make deploy-apps          # déclenche glpi-init.sh
+
+# 3.5 — comptes par défaut (à faire EN PREMIER : c'est le critère de sécurité)
+vagrant ssh node1 -c "docker exec \$(docker ps -q -f name=apps_glpi-web) sh -c \
+  'mysql -h db-proxy -u glpi -p\"\$GLPI_DB_PASSWORD\" -N -B glpi -e \
+   \"SELECT name, is_active FROM glpi_users WHERE name IN (\\\"glpi\\\",\\\"tech\\\",\\\"normal\\\",\\\"post-only\\\");\"'"
+#   attendu : glpi=1, les trois autres=0
+#   puis vérifier qu'aucun mot de passe par défaut ne fonctionne :
+curl -sk -X POST https://glpi.dockerwarts.lan/front/login.php \
+  -d 'login_name=tech&login_password=tech' | grep -qi 'erreur\|error' && echo "REFUSÉ (attendu)"
+
+# 3.1 / 3.2 — connexion et session
+curl --cacert certs/ca.crt -sc /tmp/c.txt https://glpi.dockerwarts.lan/ -o /dev/null -w '%{http_code}\n'
+grep glpi_srv /tmp/c.txt      # le cookie collant doit être présent
+#   se connecter dans un navigateur (utilisateur glpi, mot de passe de
+#   secrets/dw_glpi_admin_password.txt), naviguer 20 pages : aucune déconnexion
+
+# 3.3 — persistance des pièces jointes
+#   créer un ticket, y joindre un fichier, noter son id, puis :
+vagrant ssh node1 -c 'docker service update --force apps_glpi-web'
+#   attendre la fin du roulement, rouvrir le ticket : la pièce jointe doit s'ouvrir
+vagrant ssh node1 -c 'ls -la /srv/nfs/glpi/files/_uploads/ | head'
+
+# 3.4 — API REST
+APP=$(cat secrets/dw_glpi_app_token.txt); USR=$(cat secrets/dw_glpi_user_token.txt)
+curl --cacert certs/ca.crt -s -H "App-Token: $APP" -H "Authorization: user_token $USR" \
+  https://glpi.dockerwarts.lan/apirest.php/initSession
+#   attendu : {"session_token":"..."}
+
+# 3.7 — un seul exécuteur cron
+vagrant ssh node1 -c 'docker service ls --filter name=apps_glpi-cron'
+#   attendu : 1/1
 ```
 
 > **À confirmer au premier démarrage** : `read_only: true` sur `traefik` et
