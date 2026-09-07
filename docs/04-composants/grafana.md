@@ -182,6 +182,34 @@ Le tokenizer PromQL retire d'abord les littéraux, les sélecteurs d'étiquettes
 métriques inconnues et le contrôle croulerait sous les faux positifs jusqu'à ce que plus personne
 ne le lise.
 
+## 6 bis. Les fichiers de configuration, un par un
+
+| Fichier | Rôle | Section |
+|---|---|---|
+| `config/grafana/grafana.ini` | configuration du serveur : base Galera, clé de signature, anonymisation | §3 |
+| `config/grafana/provisioning/datasources/datasources.yml` | les 4 sources de données, à **UID fixes** | §4 |
+| `config/grafana/provisioning/dashboards/dashboards.yml` | le *provider* qui charge le répertoire des dashboards, en lecture seule | §4 |
+
+Les douze dashboards sont **générés** par `scripts/lib/gen-dashboards.py` (§5) et
+ne sont pas écrits à la main ; les modifier dans l'interface ne les modifie pas
+en git. Chacun porte un UID stable, cité par les annotations `dashboard:` des
+règles d'alerte et donc par les tickets GLPI.
+
+| Fichier | UID | Contenu |
+|---|---|---|
+| `config/grafana/dashboards/01-overview.json` | `dw-overview` | état global de la plateforme, une ligne par service |
+| `config/grafana/dashboards/02-nodes.json` | `dw-nodes` | CPU, mémoire, disque, réseau des 3 nœuds |
+| `config/grafana/dashboards/03-containers.json` | `dw-containers` | ressources par conteneur (cAdvisor) |
+| `config/grafana/dashboards/04-traefik.json` | `dw-traefik` | requêtes, codes de retour, latences par routeur |
+| `config/grafana/dashboards/05-security.json` | `dw-security` | décisions CrowdSec, bannissements, TLS |
+| `config/grafana/dashboards/06-elasticsearch.json` | `dw-elasticsearch` | santé du cluster, shards, indexation, ILM |
+| `config/grafana/dashboards/07-cassandra.json` | `dw-cassandra` | latences lecture/écriture, compaction, hints |
+| `config/grafana/dashboards/08-galera.json` | `dw-galera` | taille du cluster, flow control, certification |
+| `config/grafana/dashboards/09-availability.json` | `dw-availability` | sondes blackbox, disponibilité par URL |
+| `config/grafana/dashboards/10-backup.json` | `dw-backup` | âge, durée, taille et état de chaque sauvegarde |
+| `config/grafana/dashboards/11-logs.json` | `dw-logs` | volumétrie des logs, taux d'erreur, sources |
+| `config/grafana/dashboards/12-datalake.json` | `dw-datalake` | débit du datalake, erreurs `demo-producer`, latences d'écriture |
+
 ## 7. Supervision
 
 | Élément | Détail |

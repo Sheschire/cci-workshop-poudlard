@@ -79,11 +79,18 @@ est déjà incrémental et versionné par nature.
 
 ### Comptes de service — une politique par consommateur
 
-| Compte (valeur du secret) | Politique | Droits |
-|---|---|---|
-| `dw_minio_restic_key` | `dw-restic` | lecture/écriture/suppression sur `restic` **uniquement** |
-| `dw_minio_es_key` | `dw-elasticsearch` | lecture/écriture/suppression sur `es-snapshots` **uniquement** |
-| `dw_minio_mirror_key` | `dw-mirror` | **lecture seule** sur `restic` et `es-snapshots` |
+| Compte (valeur du secret) | Politique | Fichier | Droits |
+|---|---|---|---|
+| `dw_minio_restic_key` | `dw-restic` | `config/minio/policies/restic.json` | lecture/écriture/suppression sur `restic` **uniquement** |
+| `dw_minio_es_key` | `dw-elasticsearch` | `config/minio/policies/elasticsearch.json` | lecture/écriture/suppression sur `es-snapshots` **uniquement** |
+| `dw_minio_mirror_key` | `dw-mirror` | `config/minio/policies/mirror.json` | **lecture seule** sur `restic` et `es-snapshots` |
+
+Chaque politique est un document IAM en deux instructions : une au niveau du
+*bucket* (`ListBucket`, `GetBucketLocation`, et pour les comptes en écriture
+`ListBucketMultipartUploads`) et une au niveau des objets (`GetObject`,
+`PutObject`, `DeleteObject`, plus les opérations *multipart* — restic découpe
+les gros paquets et ne peut pas les écrire sans elles). Le compte `mirror` n'a
+que `ListBucket` et `GetObject`, sur les deux *buckets*.
 
 Le compte `mirror` est en lecture seule par conception : un job de miroir qui peut écrire dans ce
 qu'il recopie est un amplificateur de rançongiciel — une suppression malveillante côté source se

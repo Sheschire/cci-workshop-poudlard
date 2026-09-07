@@ -254,6 +254,28 @@ Le script ne se contente pas de vérifier que les politiques existent : il contr
 `index.lifecycle.name` est bien **attaché** à l'index sous-jacent de `logs-docker`. Une politique
 qui existe mais n'est pas appliquée conserverait les données indéfiniment, sans rien signaler.
 
+## 9 bis. Les fichiers de configuration, un par un
+
+Tous appliqués par `scripts/es-init.sh` : ce sont des **états voulus** poussés
+par l'API, jamais des fichiers montés dans le conteneur. La source de vérité est
+git ; ré-exécuter le script réapplique le contenu du dépôt.
+
+| Fichier | Rôle | Section |
+|---|---|---|
+| `config/elasticsearch/elasticsearch.yml` | configuration du nœud : découverte, TLS transport, mémoire | §5 |
+| `config/elasticsearch/ilm/dockerwarts-logs.json` | cycle de vie des logs : rollover puis suppression à 90 j | §6 |
+| `config/elasticsearch/ilm/dockerwarts-datalake.json` | cycle de vie du datalake : rétention 365 j | §6 |
+| `config/elasticsearch/templates/logs-common.json` | *component template* : les champs partagés par tous les logs (`@timestamp`, `host`, `container`) — définis une fois, hérités par les trois autres |
+| `config/elasticsearch/templates/logs-docker.json` | template d'index des logs de conteneurs | §7 |
+| `config/elasticsearch/templates/logs-traefik.json` | template d'index des logs d'accès Traefik | §7 |
+| `config/elasticsearch/templates/logs-system.json` | template d'index des logs système du nœud | §7 |
+| `config/elasticsearch/templates/datalake-events.json` | template du data stream `datalake-events`, `dynamic: strict` | §7 |
+| `config/elasticsearch/slm.json` | politique de snapshots `daily-snapshots` vers MinIO | §8 |
+
+Chacun porte un bloc `_meta` ou `_comment` qui explique ses propres choix, et
+qu'Elasticsearch conserve : la justification voyage avec la politique, y compris
+pour qui la lit depuis l'API et n'a pas le dépôt sous les yeux.
+
 ## 10. Supervision
 
 | Élément | Détail |

@@ -204,6 +204,35 @@ Les 15 tests s'exécutent dans `make lint` et dans la CI.
 | `order` | **`stop-first`** | TSDB local : jamais deux écrivains sur un même volume |
 | Exposition | `admin-chain@file` | allowlist + **basic-auth** : Prometheus n'a **aucune** authentification propre et son interface expose toutes les métriques de la plateforme |
 
+## 6 bis. Les fichiers de configuration, un par un
+
+| Fichier | Rôle | Section |
+|---|---|---|
+| `config/prometheus/prometheus.yml` | scrape, découverte Swarm, relabeling | §3 |
+| `config/prometheus/rules/infrastructure.yml` | alertes hôtes, Swarm, Traefik, CrowdSec, certificats, sondes blackbox | §4 |
+| `config/prometheus/rules/datastores.yml` | alertes Galera, Cassandra, Elasticsearch, GLPI | §4 |
+| `config/prometheus/rules/backup.yml` | `BackupTooOld`, `BackupFailed`, `BackupNeverRan`, `BackupDurationAnomaly`, `MinIOCapacityLow` | §4 |
+| `config/prometheus/tests/alerts_test.yml` | **15 tests unitaires** des règles, joués par `promtool test rules` | §5 |
+| `config/blackbox/blackbox.yml` | modules de sondage utilisés par le job `blackbox-*` (voir ci-dessous) |
+
+### `config/blackbox/blackbox.yml`
+
+Le *blackbox exporter* sonde la plateforme **de l'extérieur**, par le même chemin
+qu'un utilisateur : la VIP, en HTTPS, avec la CA interne. C'est ce qui distingue
+« le conteneur tourne » de « le service répond » — les deux dashboards
+`dw-availability` et `dw-overview` en dépendent.
+
+| Module | Ce qu'il vérifie | Utilisé par |
+|---|---|---|
+| `http_2xx_internal_ca` | code 2xx **et** certificat validé par `certs/ca.crt` | `blackbox-http` sur chaque nom publié |
+| `http_glpi` | idem, plus la présence de `GLPI_OK` dans le corps — un 200 servi par Apache seul ne suffit pas | `blackbox-glpi` |
+| `icmp` | joignabilité des trois nœuds | `blackbox-icmp` |
+| `tcp_connect` | ouverture des ports internes critiques | `blackbox-tcp` |
+
+Le module HTTP monte la CA interne plutôt que de désactiver la vérification :
+sonder en `insecure_skip_verify` reviendrait à ne jamais détecter un certificat
+expiré, ce qui est précisément l'une des alertes que la plateforme promet.
+
 ## 7. Sauvegarde
 
 | Élément | Sauvegardé | Méthode |

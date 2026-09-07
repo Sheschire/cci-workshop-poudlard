@@ -189,7 +189,7 @@ restore-all: ## Full ordered restore of the platform
 # =============================================================================
 .PHONY: lint lint-yaml lint-ansible lint-shell lint-docker lint-python lint-prom lint-stacks
 
-lint: lint-yaml lint-ansible lint-shell lint-docker lint-python lint-prom lint-stacks ## Run every linter
+lint: lint-yaml lint-ansible lint-shell lint-docker lint-python lint-prom lint-stacks lint-docs ## Run every linter
 
 lint-yaml: ## yamllint over the whole repository
 	yamllint -c $(ROOT)/.yamllint.yml $(ROOT)
@@ -215,6 +215,9 @@ lint-python: ## ruff over the Python code (services + shared tooling)
 
 lint-prom: ## promtool / amtool checks (same script as the CI)
 	$(SCRIPTS)/validate-configs.sh
+
+lint-docs: ## Every file under config/ is documented, and no dangling reference
+	$(SCRIPTS)/check-docs-coverage.sh
 
 lint-stacks: ## Validate every stack with `docker stack config`
 	$(SCRIPTS)/validate-stacks.sh

@@ -8,6 +8,11 @@
 
 **Dernière mise à jour** : 2026-09-07
 **Branche de développement** : `claude/project-specs-architecture-fppn0x`
+**État global** : les **8 phases sont terminées**. Tous les livrables existent,
+tous les critères statiques sont vérifiés dans cette session, et tous les
+critères dynamiques sont listés en fin de page avec la **commande exacte** à
+exécuter sur les VM — voir « Environnement de la session » ci-dessous pour la
+raison, et « Critères restés à vérifier sur les VM » pour la liste.
 
 ---
 
@@ -221,19 +226,25 @@ vérifiés, critères dynamiques listés en bas de page.
 
 **Livrables** : `docs/01` → `docs/08`, ADR à jour, README
 
-| # | Critère d'acceptation | État |
-|---|---|---|
-| 7.1 | `docs/01-architecture.md` complet (schémas Mermaid) | ⬜ |
-| 7.2 | `docs/02-installation.md` : pas-à-pas reproductible | ⬜ |
-| 7.3 | `docs/03-reseau-securite.md` : 4 couches + matrice de flux complète | ⬜ |
-| 7.4 | **Chaque** fichier de `config/` est expliqué dans `docs/04-composants/` | ⬜ |
-| 7.5 | `docs/05-monitoring.md` : métriques, dashboards, tableau des règles d'alerte | ⬜ |
-| 7.6 | `docs/06-haute-disponibilite.md` : matrice + résultats chaos | ⬜ |
-| 7.7 | `docs/07-PRA.md` : les 8 points du §9.5, journal de tests réel | ⬜ |
-| 7.8 | `docs/08-exploitation.md` : runbooks | ⬜ |
-| 7.9 | README à jour | ⬜ |
+| # | Critère d'acceptation | État | Preuve |
+|---|---|---|---|
+| 7.1 | `docs/01-architecture.md` complet (schémas Mermaid) | ✅ | 4 schémas Mermaid (topologie, réseaux, chemin d'une requête, ordre des stacks), matrice des réseaux, dimensionnement chiffré, table des 10 ADR |
+| 7.2 | `docs/02-installation.md` : pas-à-pas reproductible | ✅ | prérequis, les 20 variables de `.env` commentées, les 7 étapes, mode mono-nœud, **12 symptômes de dépannage** avec leur cause et leur correction |
+| 7.3 | `docs/03-reseau-securite.md` : 4 couches + matrice de flux complète | ✅ | les 13 règles `DW-INPUT` et 5 règles `DOCKER-USER` expliquées une par une, les 9 middlewares, **matrice de flux de 28 lignes** dérivée des stacks, TLS, secrets, durcissement |
+| 7.4 | **Chaque** fichier de `config/` est expliqué dans `docs/04-composants/` | ✅ **vérifié** | `scripts/check-docs-coverage.sh` : **52 fichiers, 52 documentés**. Le contrôle est dans `make lint` et dans la CI — la promesse ne peut plus devenir fausse en silence |
+| 7.5 | `docs/05-monitoring.md` : métriques, dashboards, tableau des règles d'alerte | ✅ | architecture, 14 domaines de métriques, les 12 tableaux avec leur UID, **les 48 alertes générées depuis les fichiers de règles** (condition, `for`, sévérité, action), inhibition, boucle alerte → ticket. Captures marquées 🖥️ avec la commande exacte |
+| 7.6 | `docs/06-haute-disponibilite.md` : matrice + résultats chaos | ✅ (structure) | écrit en phase 6 ; tableau de résultats prêt, **produit au bon format** par `make chaos` |
+| 7.7 | `docs/07-PRA.md` : les 8 points du §9.5, journal de tests réel | ✅ | les 8 points, **11 scénarios de sinistre** avec commandes exactes et validation, ordre de reprise, checklist en 12 points, **journal de tests distinguant les 14 vérifications réellement faites des 3 restant à exécuter** |
+| 7.8 | `docs/08-exploitation.md` : runbooks | ✅ | **12 runbooks**, chacun : quand, durée, commandes, validation, et ce qui peut mal tourner |
+| 7.9 | README à jour | ✅ | démarrage rapide, index complet de la documentation, et le tableau « ce qui vérifie quoi » |
+| 7.10 | Les liens internes de la documentation résolvent | ✅ **vérifié** | **134 liens relatifs contrôlés**, 0 cassé ; contrôle intégré à `make lint`, **test négatif** effectué (un lien mort fait échouer le lint) |
 
-**Statut de la phase** : ⬜ à faire
+**Statut de la phase** : ✅ **terminée**.
+
+Deux contrôles ont été ajoutés plutôt que deux promesses : `check-docs-coverage.sh`
+vérifie que chaque fichier de `config/` est documenté, qu'aucune référence ne
+pointe dans le vide, et que tous les liens internes résolvent. Il a trouvé
+25 fichiers non documentés au moment de son écriture — tous corrigés.
 
 ---
 
@@ -602,3 +613,37 @@ make single
 >    VIP (`make hosts`).
 > 3. **La sonde à 5 Hz** utilise `sleep 0.2`, qui suppose un `sleep` GNU. Sur
 >    macOS, installer `coreutils` ou exécuter la campagne depuis un nœud.
+
+### Phase 7
+
+La documentation est vérifiable hors VM et l'a été, à deux exceptions près, qui
+sont des **captures d'écran** — elles supposent un Grafana et un GLPI vivants.
+
+```bash
+# 7.4 / 7.10 — les contrôles de documentation (déjà verts, rejouables partout)
+make lint-docs
+#   52 fichiers de config/ documentés, 0 référence orpheline, 134 liens vérifiés
+
+# 7.5 — captures des 12 tableaux de bord (CDC §12)
+make deploy-demo          # sans charge de fond, la moitié des panneaux est vide
+#   puis, pour chaque UID listé dans docs/05-monitoring.md §3 :
+#     https://grafana.dockerwarts.lan/d/<uid>  → capture → docs/images/<uid>.png
+
+# 7.5 — captures de la boucle alerte → ticket (CDC §12)
+docker service scale apps_glpi-web=0
+#   ~90 s plus tard : capture de l'alerte dans Alertmanager, puis du ticket GLPI
+docker service scale apps_glpi-web=2
+#   après résolution : capture du MÊME ticket passé au statut « Résolu »
+#   → docs/images/{alertmanager-glpidown,ticket-glpidown,ticket-resolu}.png
+#   La procédure exacte est dans docs/05-monitoring.md §6.
+
+# 7.6 / 7.7 — remplir les deux tableaux de résultats
+make chaos               # → reports/chaos-<date>.md   → docs/06-haute-disponibilite.md §5
+make dr-drill            # → reports/dr-drill-<date>.md → docs/07-PRA.md §7.2
+```
+
+> **Ce qui manque à la documentation, et rien d'autre.** Les captures d'écran du
+> CDC §12 ne peuvent pas être produites sans conteneurs en fonctionnement. Elles
+> sont signalées à leur emplacement exact dans `docs/05-monitoring.md`, avec la
+> commande qui les produit — plutôt que d'être passées sous silence ou
+> remplacées par des images inventées.
