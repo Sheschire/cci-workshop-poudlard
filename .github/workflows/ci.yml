@@ -1,0 +1,184 @@
+---
+# =============================================================================
+# Dockerwarts N°1 — continuous integration (CDC §11.3).
+#
+# No cluster runs in CI: the jobs are static quality gates only.
+#   lint         yamllint, ansible-lint, shellcheck, hadolint, ruff
+#   validate     docker stack config, promtool, amtool, dashboards, secrets
+#   test-python  pytest (alert2glpi)
+#   build-scan   build the home-made images + trivy HIGH/CRITICAL
+# =============================================================================
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Lint (YAML, Ansible, shell, Dockerfiles, Python)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install the Python tooling
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install yamllint ansible-lint 'ansible-core>=2.16' ruff
+
+      - name: Install the Ansible collections
+        run: ansible-galaxy collection install -r ansible/requirements.yml
+
+      - name: yamllint
+        run: yamllint -c .yamllint.yml .
+
+      - name: ansible-lint
+        run: cd ansible && ansible-lint
+
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          # The firewall script is a Jinja template; shellcheck still parses it
+          # because every substitution sits inside a string or a comment.
+          mapfile -t files < <(find . -type f -name '*.sh' -not -path './.git/*' | sort)
+          files+=("ansible/roles/firewall/templates/dockerwarts-firewall.sh.j2")
+          shellcheck --external-sources --source-path=scripts --shell=bash "${files[@]}"
+
+      - name: hadolint
+        run: |
+          curl -sSLo /tmp/hadolint \
+            https://github.com/hadolint/hadolint/releases/download/v2.12.0/hadolint-Linux-x86_64
+          chmod +x /tmp/hadolint
+          find images -name Dockerfile -print0 2>/dev/null | xargs -0 -r /tmp/hadolint
+
+      - name: ruff
+        run: |
+          # `images/` appears with the first home-made image (phase 2).
+          if [ -d images ]; then
+            ruff check images
+            ruff format --check images
+          else
+            echo "::notice::images/ does not exist yet"
+          fi
+
+  # ---------------------------------------------------------------------------
+  validate:
+    name: Validate (stacks, Prometheus, Alertmanager, dashboards)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install promtool and amtool
+        run: |
+          curl -sSL https://github.com/prometheus/prometheus/releases/download/v3.6.0/prometheus-3.6.0.linux-amd64.tar.gz \
+            | tar xz -C /tmp
+          curl -sSL https://github.com/prometheus/alertmanager/releases/download/v0.28.1/alertmanager-0.28.1.linux-amd64.tar.gz \
+            | tar xz -C /tmp
+          sudo install /tmp/prometheus-3.6.0.linux-amd64/promtool /usr/local/bin/
+          sudo install /tmp/alertmanager-0.28.1.linux-amd64/amtool /usr/local/bin/
+
+      - name: Validate every stack with a sample .env
+        run: |
+          cp .env.example .env
+          ./scripts/validate-stacks.sh
+
+      # promtool / amtool / JSON / Grafana coherence. The script skips — and
+      # reports — any block whose input has not landed yet (CDC §13 phases).
+      - name: Validate the monitoring configuration
+        run: ./scripts/validate-configs.sh
+
+      - name: Fail if a secret leaked into the repository
+        run: ./scripts/check-no-secrets.sh
+
+  # ---------------------------------------------------------------------------
+  test-python:
+    name: Unit tests (alert2glpi)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # alert2glpi is a phase 4 deliverable; until it exists the job reports
+      # "skipped" rather than failing the whole pipeline.
+      - name: Is alert2glpi present?
+        id: probe
+        run: |
+          if [ -f images/alert2glpi/requirements.txt ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::images/alert2glpi is not implemented yet (phase 4)"
+          fi
+
+      - name: Install the dependencies
+        if: steps.probe.outputs.present == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r images/alert2glpi/requirements.txt
+          python -m pip install -r images/alert2glpi/requirements-dev.txt
+
+      - name: pytest
+        if: steps.probe.outputs.present == 'true'
+        run: python -m pytest images/alert2glpi/tests -q
+
+  # ---------------------------------------------------------------------------
+  build-scan:
+    name: Build the home-made images and scan them
+    runs-on: ubuntu-24.04
+    needs: [lint]
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [cassandra, alert2glpi, backup-runner, demo-producer]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Each home-made image lands in its own phase (cassandra: 2,
+      # alert2glpi: 4, backup-runner: 5, demo-producer: 6).
+      - name: Is images/${{ matrix.image }} present?
+        id: probe
+        run: |
+          if [ -f "images/${{ matrix.image }}/Dockerfile" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::images/${{ matrix.image }} is not implemented yet"
+          fi
+
+      - name: Build ${{ matrix.image }}
+        if: steps.probe.outputs.present == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: images/${{ matrix.image }}
+          push: false
+          load: true
+          tags: dockerwarts/${{ matrix.image }}:ci
+
+      - name: Trivy scan (HIGH, CRITICAL)
+        if: steps.probe.outputs.present == 'true'
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: dockerwarts/${{ matrix.image }}:ci
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL

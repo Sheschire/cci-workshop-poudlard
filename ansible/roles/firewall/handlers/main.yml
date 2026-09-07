@@ -1,0 +1,8 @@
+---
+- name: Reload systemd
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+
+- name: Apply the dockerwarts firewall
+  ansible.builtin.command: /usr/local/sbin/dockerwarts-firewall start
+  changed_when: true

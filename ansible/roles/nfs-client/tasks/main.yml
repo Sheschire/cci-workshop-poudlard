@@ -1,0 +1,34 @@
+---
+# =============================================================================
+# Role `nfs-client` — NFSv4 client bits on every node.
+#
+# The GLPI volumes are declared in `stacks/apps.yml` with the Docker `local`
+# driver and `type: nfs` options, so the mount is performed by the Docker
+# daemon itself: no host-side fstab entry is needed, only the kernel client and
+# its userland helpers.
+# =============================================================================
+
+- name: Install the NFS client utilities
+  ansible.builtin.apt:
+    name: nfs-common
+    state: present
+
+- name: Enable the NFSv4 id mapper
+  ansible.builtin.service:
+    name: nfs-idmapd
+    state: started
+    enabled: true
+  # rpc.idmapd is only started on demand on some images; never fail the play
+  # over it, the numeric ids (anonuid/anongid) are what actually matter.
+  failed_when: false
+
+- name: Check that the NFS export is reachable from this node
+  ansible.builtin.command: "showmount -e {{ nfs_client_server_ip }}"
+  register: nfs_client_showmount
+  changed_when: false
+  retries: 6
+  delay: 5
+  until: nfs_client_showmount.rc == 0
+  # showmount speaks NFSv3/rpcbind; a v4-only server answers but may not list.
+  # The authoritative check is the volume mount performed at deploy time.
+  failed_when: false

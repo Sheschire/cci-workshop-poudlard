@@ -19,3 +19,10 @@ __pycache__/
 node_modules/
 .DS_Store
 *.log
+
+# Ansible controller artefacts
+.ansible/
+ansible/inventory/hosts.yml
+
+# Test and drill reports (only the ones copied into docs/ are committed)
+reports/

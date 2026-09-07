@@ -1,0 +1,25 @@
+# ruff — lint + format for the home-made Python services (CDC §10.2).
+target-version = "py312"
+line-length = 100
+
+[lint]
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes
+    "I",        # isort
+    "B",        # flake8-bugbear
+    "UP",       # pyupgrade
+    "S",        # flake8-bandit (security)
+    "C4",       # comprehensions
+    "SIM",      # simplify
+    "RUF",
+]
+ignore = [
+    "S101",  # `assert` is how pytest expresses its checks
+]
+
+[lint.per-file-ignores]
+"**/tests/*" = ["S105", "S106"]  # hard-coded test tokens are intentional
+
+[format]
+quote-style = "double"

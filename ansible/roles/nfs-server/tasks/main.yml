@@ -1,0 +1,79 @@
+---
+# =============================================================================
+# Role `nfs-server` — NFSv4 export of the GLPI shared state and of the backup
+# metrics directory. Applied to the `nfs_server` group only (node1).
+#
+# This is the platform's single shared filesystem and an assumed SPOF
+# (ADR-0006): every database uses local volumes replicated by its own engine.
+# The failover procedure (move the group, re-run the role, restore from restic,
+# update NFS_SERVER, redeploy `apps`) is in docs/07-PRA.md.
+# =============================================================================
+
+- name: Install the NFS server
+  ansible.builtin.apt:
+    name: nfs-kernel-server
+    state: present
+
+- name: Create the export directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    mode: "0775"
+    owner: "{{ item.owner }}"
+    group: "{{ item.group }}"
+  loop: "{{ dw_nfs_exports }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+# NFSv4 only (`fsid=0` on the pseudo-root is not used: each directory is
+# exported independently so a single mount failure cannot hide the others).
+#   rw            GLPI writes attachments; the backup jobs write .prom files
+#   sync          acknowledge writes only once on disk — GLPI documents must
+#                 survive a node crash
+#   no_subtree_check  standard for whole-directory exports
+#   root_squash   a container running as root must not be root on the export
+#   no_wdelay     the metrics files are small and written atomically
+- name: Deploy /etc/exports
+  ansible.builtin.template:
+    src: exports.j2
+    dest: /etc/exports
+    mode: "0644"
+    owner: root
+    group: root
+  notify: Reload NFS exports
+
+- name: Restrict the NFSv4 lease time (faster client recovery)
+  ansible.builtin.copy:
+    dest: /etc/default/nfs-kernel-server
+    mode: "0644"
+    owner: root
+    group: root
+    content: |
+      # Managed by Ansible — dockerwarts
+      RPCNFSDCOUNT=16
+      RPCMOUNTDOPTS="--manage-gids --no-nfs-version 3"
+      NEED_SVCGSSD="no"
+  notify: Restart NFS server
+
+- name: Enable and start the NFS server
+  ansible.builtin.service:
+    name: nfs-server
+    state: started
+    enabled: true
+
+- name: Apply pending NFS changes now
+  ansible.builtin.meta: flush_handlers
+
+- name: Check that the exports are published
+  ansible.builtin.command: exportfs -s
+  register: nfs_server_exportfs
+  changed_when: false
+
+- name: Fail if an export is missing
+  ansible.builtin.assert:
+    that:
+      - item.path in nfs_server_exportfs.stdout
+    fail_msg: "Export {{ item.path }} is not published by exportfs."
+  loop: "{{ dw_nfs_exports }}"
+  loop_control:
+    label: "{{ item.path }}"

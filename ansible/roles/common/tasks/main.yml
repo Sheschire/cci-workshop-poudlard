@@ -1,0 +1,201 @@
+---
+# =============================================================================
+# Role `common` — base OS setup shared by the three nodes.
+# Packages, timezone, sysctl, limits, SSH hardening, fail2ban, logrotate.
+# =============================================================================
+
+- name: Set the system timezone
+  community.general.timezone:
+    name: "{{ dw_timezone }}"
+  notify: Restart cron
+
+- name: Install base packages
+  ansible.builtin.apt:
+    name:
+      - ca-certificates      # TLS trust store, needed by the Docker repo
+      - curl
+      - gnupg
+      - jq                   # used by the operator runbooks and smoke tests
+      - python3-pip
+      - iptables             # nftables backend on Ubuntu 24.04
+      - iptables-persistent  # provides netfilter-persistent
+      - fail2ban             # SSH jail only (ADR-0004)
+      - unattended-upgrades
+      - chrony               # clock discipline: Galera and Cassandra need it
+      - logrotate
+      - rsync                # used by the NFS failover runbook
+      - nfs-common           # NFS client on every node (GLPI volumes)
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Enable and start chrony
+  ansible.builtin.service:
+    name: chrony
+    state: started
+    enabled: true
+
+# --- Kernel tuning -----------------------------------------------------------
+# Applied both at runtime and persisted, so a reboot keeps the cluster healthy.
+- name: Apply kernel parameters
+  ansible.posix.sysctl:
+    name: "{{ item.key }}"
+    value: "{{ item.value }}"
+    sysctl_file: /etc/sysctl.d/99-dockerwarts.conf
+    sysctl_set: true
+    reload: true
+    state: present
+  loop: "{{ dw_sysctls | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}={{ item.value }}"
+
+- name: Disable swap at runtime
+  ansible.builtin.command: swapoff -a
+  register: common_swapoff
+  changed_when: false
+  failed_when: false
+
+- name: Disable swap in /etc/fstab
+  ansible.builtin.replace:
+    path: /etc/fstab
+    regexp: '^([^#].*\sswap\s+sw\s+.*)$'
+    replace: '# \1   # disabled by Ansible (dockerwarts)'
+
+# --- File descriptors and memlock -------------------------------------------
+# Elasticsearch (`bootstrap.memory_lock`) and Cassandra need unlimited memlock
+# and a high nofile. Docker passes the daemon limits down to the containers.
+- name: Raise system limits for datastore workloads
+  ansible.builtin.copy:
+    dest: /etc/security/limits.d/99-dockerwarts.conf
+    mode: "0644"
+    owner: root
+    group: root
+    content: |
+      # Managed by Ansible — dockerwarts
+      *  soft  nofile  262144
+      *  hard  nofile  262144
+      *  soft  memlock unlimited
+      *  hard  memlock unlimited
+      *  soft  nproc   32768
+      *  hard  nproc   32768
+
+# --- SSH hardening -----------------------------------------------------------
+- name: Harden the SSH daemon
+  ansible.builtin.copy:
+    dest: /etc/ssh/sshd_config.d/99-dockerwarts.conf
+    mode: "0600"
+    owner: root
+    group: root
+    content: |
+      # Managed by Ansible — dockerwarts (CDC §6.1)
+      PermitRootLogin no
+      PasswordAuthentication no
+      ChallengeResponseAuthentication no
+      KbdInteractiveAuthentication no
+      PubkeyAuthentication yes
+      X11Forwarding no
+      MaxAuthTries 3
+      ClientAliveInterval 300
+      ClientAliveCountMax 2
+  notify: Restart sshd
+
+# --- fail2ban ----------------------------------------------------------------
+# Only the sshd jail: HTTP protection is CrowdSec's job (ADR-0004).
+- name: Configure the fail2ban sshd jail
+  ansible.builtin.copy:
+    dest: /etc/fail2ban/jail.d/dockerwarts.local
+    mode: "0644"
+    owner: root
+    group: root
+    content: |
+      # Managed by Ansible — dockerwarts
+      [DEFAULT]
+      backend  = systemd
+      bantime  = 1h
+      findtime = 10m
+      maxretry = 5
+      ignoreip = 127.0.0.1/8 {{ dw_cluster_cidr }} {{ dw_admin_cidr }}
+
+      [sshd]
+      enabled = true
+      port    = ssh
+  notify: Restart fail2ban
+
+- name: Enable and start fail2ban
+  ansible.builtin.service:
+    name: fail2ban
+    state: started
+    enabled: true
+
+# --- Unattended upgrades -----------------------------------------------------
+- name: Enable unattended security upgrades
+  ansible.builtin.copy:
+    dest: /etc/apt/apt.conf.d/20auto-upgrades
+    mode: "0644"
+    owner: root
+    group: root
+    content: |
+      // Managed by Ansible — dockerwarts
+      APT::Periodic::Update-Package-Lists "1";
+      APT::Periodic::Unattended-Upgrade "1";
+      APT::Periodic::AutocleanInterval "7";
+
+# Docker and containerd are pinned (dw_docker_version): never let unattended
+# upgrades restart the engine under a running Swarm.
+- name: Exclude Docker packages from unattended upgrades
+  ansible.builtin.copy:
+    dest: /etc/apt/apt.conf.d/51dockerwarts-blacklist
+    mode: "0644"
+    owner: root
+    group: root
+    content: |
+      // Managed by Ansible — dockerwarts
+      Unattended-Upgrade::Package-Blacklist {
+          "docker-ce";
+          "docker-ce-cli";
+          "containerd.io";
+      };
+
+# --- Traefik access log rotation --------------------------------------------
+# Traefik writes its JSON access log to a host bind mount; CrowdSec agents and
+# Fluent Bit tail the same file. `copytruncate` keeps both readers happy: the
+# inode is preserved, so neither has to be restarted.
+- name: Create the Traefik log directory
+  ansible.builtin.file:
+    path: /var/log/traefik
+    state: directory
+    mode: "0755"
+    owner: root
+    group: root
+
+- name: Install logrotate rules for the Traefik access log
+  ansible.builtin.copy:
+    dest: /etc/logrotate.d/traefik
+    mode: "0644"
+    owner: root
+    group: root
+    content: |
+      # Managed by Ansible — dockerwarts
+      /var/log/traefik/*.log {
+          daily
+          rotate 7
+          size 100M
+          missingok
+          notifempty
+          compress
+          delaycompress
+          copytruncate
+      }
+
+- name: Add /etc/hosts entries for the cluster members and the VIP
+  ansible.builtin.blockinfile:
+    path: /etc/hosts
+    marker: "# {mark} ANSIBLE MANAGED — dockerwarts"
+    block: |
+      {% for host in groups['swarm_managers'] %}
+      {{ hostvars[host].cluster_ip }} {{ host }}
+      {% endfor %}
+      {# One line per name keeps the file readable and diffable. #}
+      {% for name in dw_published_hostnames %}
+      {{ dw_vip }} {{ name }}.{{ dw_domain }}
+      {% endfor %}

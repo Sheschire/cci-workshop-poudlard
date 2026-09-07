@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+# =============================================================================
+# Dockerwarts host firewall — managed by Ansible, do not edit on the node.
+#
+# Called either by systemd (dockerwarts-firewall.service, after docker.service)
+# or by netfilter-persistent (plugins.d/10-dockerwarts) with one of
+# start | stop | restart | reload | save | flush.
+#
+# It owns exactly two chains and rebuilds them from scratch, which makes it
+# idempotent: running it twice yields the exact same ruleset.
+#
+#   DW-INPUT     host services (SSH, Swarm, NFS, VRRP, registry, ICMP)
+#   DOCKER-USER  traffic *forwarded to containers*, evaluated before Docker's
+#                own rules — the only place where published ports can be
+#                filtered (CDC §6.1).
+#
+# Node                : {{ inventory_hostname }} ({{ cluster_ip }})
+# Cluster subnet      : {{ dw_cluster_cidr }}
+# Administration host : {{ dw_admin_cidr }}
+# =============================================================================
+set -Eeuo pipefail
+
+readonly CLUSTER_CIDR="{{ dw_cluster_cidr }}"
+readonly ADMIN_CIDR="{{ dw_admin_cidr }}"
+readonly OVERLAY_POOL="{{ dw_swarm_default_addr_pool }}"
+readonly BRIDGE_POOL="172.20.0.0/16"
+readonly WAN_IF="{{ ansible_default_ipv4.interface | default('eth0') }}"
+# Rendered by Ansible: 1 on the node holding the role, 0 elsewhere.
+readonly IS_NFS_SERVER="{{ 1 if 'nfs_server' in group_names else 0 }}"
+readonly IS_REGISTRY="{{ 1 if (swarm_labels | default({})).get('registry', '') == 'true' else 0 }}"
+
+log() { printf '[dockerwarts-firewall] %s\n' "$*" >&2; }
+die() { log "ERROR: $*"; exit 1; }
+
+# --- helpers -----------------------------------------------------------------
+
+# Create a chain if it is missing (never fails when it already exists).
+ensure_chain() {
+  local chain=$1
+  iptables -n -L "$chain" >/dev/null 2>&1 || iptables -N "$chain"
+}
+
+# Add a rule only if an identical one is absent — used for the INPUT jump,
+# which must survive alongside rules we do not own.
+ensure_rule() {
+  local chain=$1; shift
+  iptables -C "$chain" "$@" 2>/dev/null || iptables -A "$chain" "$@"
+}
+
+# =============================================================================
+# DW-INPUT — traffic addressed to the host itself.
+# =============================================================================
+build_input() {
+  ensure_chain DW-INPUT
+  iptables -F DW-INPUT
+
+  # Loopback and already-established flows first: cheapest and most frequent.
+  iptables -A DW-INPUT -i lo -j ACCEPT
+  iptables -A DW-INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  iptables -A DW-INPUT -m conntrack --ctstate INVALID -j DROP
+
+  # ICMP echo: diagnostics, and the blackbox `icmp` probe that watches the VIP.
+  iptables -A DW-INPUT -p icmp --icmp-type echo-request \
+    -m limit --limit 10/second --limit-burst 20 -j ACCEPT
+  iptables -A DW-INPUT -p icmp --icmp-type destination-unreachable -j ACCEPT
+  iptables -A DW-INPUT -p icmp --icmp-type time-exceeded -j ACCEPT
+
+  # SSH administration, restricted to the admin workstation and to the peers
+  # (the operator hops between nodes during the PRA procedures).
+  iptables -A DW-INPUT -p tcp --dport 22 -s "$ADMIN_CIDR" -m conntrack --ctstate NEW -j ACCEPT
+  iptables -A DW-INPUT -p tcp --dport 22 -s "$CLUSTER_CIDR" -m conntrack --ctstate NEW -j ACCEPT
+
+  # Traefik, published in host mode on every node (ADR-0003): open to the world.
+  iptables -A DW-INPUT -p tcp -m multiport --dports 80,443 -j ACCEPT
+
+  # --- Swarm control and data plane, cluster-scoped -------------------------
+  # 2377/tcp  Raft (managers)      7946/tcp+udp gossip
+  # 4789/udp  VXLAN overlay        proto 50     ESP, encrypted overlays
+  iptables -A DW-INPUT -p tcp --dport 2377 -s "$CLUSTER_CIDR" -j ACCEPT
+  iptables -A DW-INPUT -p tcp --dport 7946 -s "$CLUSTER_CIDR" -j ACCEPT
+  iptables -A DW-INPUT -p udp --dport 7946 -s "$CLUSTER_CIDR" -j ACCEPT
+  iptables -A DW-INPUT -p udp --dport 4789 -s "$CLUSTER_CIDR" -j ACCEPT
+  iptables -A DW-INPUT -p esp -s "$CLUSTER_CIDR" -j ACCEPT
+
+  # Docker Engine metrics (daemon.json metrics-addr), scraped by Prometheus.
+  iptables -A DW-INPUT -p tcp --dport 9323 -s "$CLUSTER_CIDR" -j ACCEPT
+
+  # VRRP (proto 112) for Keepalived, including the 224.0.0.18 multicast group.
+  iptables -A DW-INPUT -p vrrp -s "$CLUSTER_CIDR" -j ACCEPT
+  iptables -A DW-INPUT -p vrrp -d 224.0.0.18 -j ACCEPT
+
+  # NFS export of the GLPI files — node1 only (ADR-0006).
+  if [[ $IS_NFS_SERVER -eq 1 ]]; then
+    iptables -A DW-INPUT -p tcp --dport 2049 -s "$CLUSTER_CIDR" -j ACCEPT
+    iptables -A DW-INPUT -p tcp --dport 111  -s "$CLUSTER_CIDR" -j ACCEPT
+    iptables -A DW-INPUT -p udp --dport 111  -s "$CLUSTER_CIDR" -j ACCEPT
+  fi
+
+  # Internal registry — node3 only, published in host mode (CDC §10.2).
+  if [[ $IS_REGISTRY -eq 1 ]]; then
+    iptables -A DW-INPUT -p tcp --dport 5000 -s "$CLUSTER_CIDR" -j ACCEPT
+  fi
+
+  # Log a sample of what is dropped: material for the CrowdSec `linux`
+  # collection and for the security dashboard.
+  iptables -A DW-INPUT -m limit --limit 2/min --limit-burst 5 \
+    -j LOG --log-prefix "dw-input-drop: " --log-level 4
+  iptables -A DW-INPUT -j DROP
+
+  # Policies and the single jump from INPUT.
+  iptables -P INPUT DROP
+  iptables -P OUTPUT ACCEPT
+  # FORWARD stays DROP: Docker inserts its own ACCEPT rules for the bridges it
+  # manages, and DOCKER-USER (below) gates them.
+  iptables -P FORWARD DROP
+  ensure_rule INPUT -j DW-INPUT
+}
+
+# =============================================================================
+# DOCKER-USER — traffic forwarded *to containers*.
+#
+# Docker bypasses INPUT entirely for published ports: it adds its own ACCEPT
+# rules in FORWARD. DOCKER-USER is inserted before them, so it is the only
+# effective filter. Docker ships it containing a single `-j RETURN`.
+# =============================================================================
+build_docker_user() {
+  ensure_chain DOCKER-USER
+  iptables -F DOCKER-USER
+
+  # Established flows return immediately.
+  iptables -A DOCKER-USER -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
+
+  # Anything coming from inside the cluster or from the container networks
+  # themselves is legitimate east-west traffic.
+  iptables -A DOCKER-USER -s "$CLUSTER_CIDR"  -j RETURN
+  iptables -A DOCKER-USER -s "$OVERLAY_POOL"  -j RETURN
+  iptables -A DOCKER-USER -s "$BRIDGE_POOL"   -j RETURN
+
+  # From the outside world, only the Traefik entrypoints may reach a container.
+  iptables -A DOCKER-USER -i "$WAN_IF" -p tcp -m multiport --dports 80,443 -j RETURN
+
+  # Never let an external interface reach the overlay/bridge ranges directly:
+  # this closes the classic bypass where a published database port answers on
+  # the host address (checked by tests/smoke/network-isolation.sh).
+  iptables -A DOCKER-USER -i "$WAN_IF" -d "$OVERLAY_POOL" -j DROP
+  iptables -A DOCKER-USER -i "$WAN_IF" -d "$BRIDGE_POOL"  -j DROP
+
+  iptables -A DOCKER-USER -i "$WAN_IF" -m limit --limit 2/min --limit-burst 5 \
+    -j LOG --log-prefix "dw-docker-drop: " --log-level 4
+  iptables -A DOCKER-USER -i "$WAN_IF" -j DROP
+
+  # Marker rule: `iptables -S DOCKER-USER | grep DW-DOCKER-USER-END` is the
+  # acceptance check of phase 0 and the assertion in the Ansible role.
+  iptables -A DOCKER-USER -m comment --comment "DW-DOCKER-USER-END" -j RETURN
+}
+
+# =============================================================================
+# IPv6 — the platform is IPv4-only; drop everything but loopback rather than
+# leaving an unfiltered stack behind.
+# =============================================================================
+build_ipv6() {
+  command -v ip6tables >/dev/null 2>&1 || return 0
+  ip6tables -P INPUT DROP   2>/dev/null || return 0
+  ip6tables -P FORWARD DROP 2>/dev/null || true
+  ip6tables -P OUTPUT ACCEPT 2>/dev/null || true
+  ensure_chain6 DW-INPUT6
+  ip6tables -F DW-INPUT6
+  ip6tables -A DW-INPUT6 -i lo -j ACCEPT
+  ip6tables -A DW-INPUT6 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  ip6tables -A DW-INPUT6 -p ipv6-icmp -j ACCEPT
+  ip6tables -A DW-INPUT6 -j DROP
+  ip6tables -C INPUT -j DW-INPUT6 2>/dev/null || ip6tables -A INPUT -j DW-INPUT6
+}
+
+ensure_chain6() {
+  local chain=$1
+  ip6tables -n -L "$chain" >/dev/null 2>&1 || ip6tables -N "$chain"
+}
+
+# =============================================================================
+# Entry points
+# =============================================================================
+do_start() {
+  iptables -n -L DOCKER-USER >/dev/null 2>&1 \
+    || log "DOCKER-USER missing (Docker not started yet?) — it will be created"
+  build_input
+  build_docker_user
+  build_ipv6
+  log "firewall applied on {{ inventory_hostname }}"
+}
+
+# `stop` is deliberately permissive: it is what an operator runs to regain
+# access after locking themselves out, and what netfilter-persistent calls
+# during package removal.
+do_stop() {
+  iptables -P INPUT ACCEPT
+  iptables -P FORWARD ACCEPT
+  iptables -P OUTPUT ACCEPT
+  iptables -D INPUT -j DW-INPUT 2>/dev/null || true
+  iptables -F DW-INPUT 2>/dev/null || true
+  iptables -X DW-INPUT 2>/dev/null || true
+  iptables -F DOCKER-USER 2>/dev/null || true
+  iptables -A DOCKER-USER -j RETURN 2>/dev/null || true
+  log "firewall rules removed (fail-open)"
+}
+
+case "${1:-start}" in
+  start|restart|reload) do_start ;;
+  stop|flush)           do_stop ;;
+  # netfilter-persistent asks plugins to persist their state; ours is generated
+  # by Ansible and replayed at boot by the systemd unit, so there is nothing
+  # to dump here.
+  save)                 log "nothing to save (rules are generated)" ;;
+  *)                    die "usage: $0 {start|stop|restart|reload|save|flush}" ;;
+esac

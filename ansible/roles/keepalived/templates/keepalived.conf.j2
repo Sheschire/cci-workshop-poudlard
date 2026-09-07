@@ -1,0 +1,72 @@
+# Managed by Ansible — dockerwarts. Do not edit on the node.
+#
+# Node     : {{ inventory_hostname }} ({{ cluster_ip }})
+# Priority : {{ keepalived_priority }}
+# VIP      : {{ dw_vip }}/{{ dw_keepalived_vip_cidr }} on {{ dw_cluster_interface }}
+
+global_defs {
+    router_id {{ inventory_hostname }}
+    # Keepalived's own scripts run as an unprivileged user by default since
+    # 2.x; chk_traefik only needs to reach 127.0.0.1:80, so keep it that way.
+    enable_script_security
+    script_user root
+    # VRRPv3 speaks IPv4 multicast; the host firewall allows proto 112 from
+    # the cluster subnet and to 224.0.0.18.
+    vrrp_version 3
+}
+
+# ---------------------------------------------------------------------------
+# Health check: is the *local* Traefik answering?
+#   interval 2  → checked every 2 seconds
+#   fall 2      → two consecutive failures mark the script as failed (~4 s)
+#   rise 2      → two consecutive successes bring it back
+#   weight      → priority delta applied while the script is failing
+# This is what keeps the sub-5 s failover target of CDC §N1: a node that
+# cannot serve HTTP loses the VIP instead of blackholing the traffic.
+# ---------------------------------------------------------------------------
+vrrp_script chk_traefik {
+    script  "/usr/local/sbin/chk_traefik"
+    interval 2
+    timeout  1
+    fall     2
+    rise     2
+    weight   {{ dw_keepalived_check_weight }}
+}
+
+vrrp_instance VI_1 {
+    state           {{ 'MASTER' if keepalived_priority >= 150 else 'BACKUP' }}
+    interface       {{ dw_cluster_interface }}
+    virtual_router_id {{ dw_keepalived_router_id }}
+    priority        {{ keepalived_priority }}
+    advert_int      1
+
+    # Preemption is ON (no `nopreempt`): once node1 is healthy again it takes
+    # the VIP back, which keeps the topology predictable — CDC §7.1.
+    preempt_delay   5
+
+    authentication {
+        auth_type PASS
+        auth_pass {{ dw_keepalived_password }}
+    }
+
+    unicast_src_ip {{ cluster_ip }}
+    unicast_peer {
+{% for host in groups['swarm_managers'] if host != inventory_hostname %}
+        {{ hostvars[host].cluster_ip }}
+{% endfor %}
+    }
+
+    virtual_ipaddress {
+        {{ dw_vip }}/{{ dw_keepalived_vip_cidr }} dev {{ dw_cluster_interface }}
+    }
+
+    track_script {
+        chk_traefik
+    }
+
+    # Trace every transition into the journal: `journalctl -u keepalived` is
+    # how tests/chaos/kill-node.sh documents the measured failover time.
+    notify_master "/usr/bin/logger -t keepalived 'MASTER on {{ inventory_hostname }}'"
+    notify_backup "/usr/bin/logger -t keepalived 'BACKUP on {{ inventory_hostname }}'"
+    notify_fault  "/usr/bin/logger -t keepalived 'FAULT on {{ inventory_hostname }}'"
+}

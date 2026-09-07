@@ -1,0 +1,94 @@
+---
+# =============================================================================
+# Role `docker` — Docker Engine from the official Docker repository.
+# Pinned version, daemon.json (log rotation, metrics, insecure registry),
+# and the Python SDK required by the community.docker modules.
+# =============================================================================
+
+- name: Create the APT keyring directory
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: "0755"
+    owner: root
+    group: root
+
+- name: Install the Docker GPG key
+  ansible.builtin.get_url:
+    url: https://download.docker.com/linux/ubuntu/gpg
+    dest: /etc/apt/keyrings/docker.asc
+    mode: "0644"
+    owner: root
+    group: root
+
+- name: Add the Docker APT repository
+  ansible.builtin.apt_repository:
+    repo: >-
+      deb [arch={{ 'amd64' if ansible_architecture == 'x86_64' else 'arm64' }}
+      signed-by=/etc/apt/keyrings/docker.asc]
+      https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable
+    filename: docker
+    state: present
+    update_cache: true
+
+# Version-pinned: an engine upgrade under a live Swarm is an operator decision,
+# not an apt side effect (see also the unattended-upgrades blacklist).
+- name: Install Docker Engine
+  ansible.builtin.apt:
+    name:
+      - "docker-ce{{ ('=' + dw_docker_version) if dw_docker_version else '' }}"
+      - "docker-ce-cli{{ ('=' + dw_docker_version) if dw_docker_version else '' }}"
+      - containerd.io
+      - docker-buildx-plugin
+      - docker-compose-plugin
+    state: present
+    update_cache: true
+  notify: Restart docker
+
+- name: Hold the Docker packages at the pinned version
+  ansible.builtin.dpkg_selections:
+    name: "{{ item }}"
+    selection: hold
+  loop:
+    - docker-ce
+    - docker-ce-cli
+    - containerd.io
+  when: dw_docker_version | length > 0
+
+# The community.docker modules talk to the Docker API through the Python SDK.
+# Ubuntu 24.04 ships a PEP 668 "externally managed" Python, hence the flag.
+- name: Install the Docker Python SDK
+  ansible.builtin.pip:
+    name:
+      - docker>=7.1.0
+    state: present
+    extra_args: --break-system-packages
+
+- name: Deploy /etc/docker/daemon.json
+  ansible.builtin.template:
+    src: daemon.json.j2
+    dest: /etc/docker/daemon.json
+    mode: "0644"
+    owner: root
+    group: root
+    validate: "python3 -c \"import json,sys; json.load(open('%s'))\""
+  notify: Restart docker
+
+- name: Enable and start Docker
+  ansible.builtin.service:
+    name: docker
+    state: started
+    enabled: true
+
+# Handlers run at the end of the play; the Swarm role needs a live daemon that
+# already applied daemon.json, so flush here.
+- name: Apply pending Docker restarts before continuing
+  ansible.builtin.meta: flush_handlers
+
+- name: Wait for the Docker socket to be ready
+  ansible.builtin.command: docker info --format '{% raw %}{{.ServerVersion}}{% endraw %}'
+  register: docker_daemon_info
+  changed_when: false
+  retries: 15
+  delay: 2
+  until: docker_daemon_info.rc == 0

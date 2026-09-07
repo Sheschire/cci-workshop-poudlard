@@ -1,0 +1,24 @@
+---
+# ansible-lint — production profile (CDC §10.2).
+#
+# Run from this directory (`cd ansible && ansible-lint`) so that ansible.cfg
+# provides `roles_path`; otherwise the roles referenced by the playbooks are
+# not found.
+profile: production
+
+exclude_paths:
+  - .cache/
+
+# `inventory/hosts.yml` is git-ignored; lint the committed example instead.
+kinds:
+  - yaml: "inventory/hosts.yml.example"
+
+skip_list:
+  # Role directories are hyphenated (nfs-server, node-labels), which is the
+  # naming used throughout the CDC and the documentation.
+  - role-name
+  # No role is published to Galaxy; a galaxy_info block would be noise.
+  - meta-no-info
+
+warn_list:
+  - experimental

@@ -1,0 +1,77 @@
+---
+# Dockerwarts N°1 — inventory.
+#
+#   cp ansible/inventory/hosts.yml.example ansible/inventory/hosts.yml
+#
+# This file is the ONLY coupling point between the playbooks and the
+# infrastructure: replacing the three Vagrant VMs by three cloud instances is a
+# matter of changing `ansible_host`, `ansible_user` and the private key
+# (ADR-0002). Everything else (roles, firewall, Swarm) is unchanged.
+#
+# `hosts.yml` itself is git-ignored.
+
+all:
+  vars:
+    ansible_user: vagrant
+    ansible_ssh_private_key_file: "~/.vagrant.d/insecure_private_key"
+    ansible_python_interpreter: /usr/bin/python3
+
+  children:
+    # ---------------------------------------------------------------------
+    # Every node is a Swarm manager (3 managers = Raft quorum 2/3, ADR-0001).
+    # ---------------------------------------------------------------------
+    swarm_managers:
+      hosts:
+        node1:
+          ansible_host: 192.168.56.11
+          # Private key used by Vagrant for this specific machine.
+          ansible_ssh_private_key_file: ".vagrant/machines/node1/virtualbox/private_key"
+          # Cluster IP: the address advertised to Swarm, Keepalived and NFS.
+          cluster_ip: 192.168.56.11
+          # VRRP priority: node1 is the preferred VIP holder.
+          keepalived_priority: 150
+          # Swarm placement labels (CDC §5.3).
+          swarm_labels:
+            cassandra: "1"
+            es: "1"
+            galera: "1"
+            prometheus: "a"
+            nfs: "true"
+        node2:
+          ansible_host: 192.168.56.12
+          ansible_ssh_private_key_file: ".vagrant/machines/node2/virtualbox/private_key"
+          cluster_ip: 192.168.56.12
+          keepalived_priority: 100
+          swarm_labels:
+            cassandra: "2"
+            es: "2"
+            galera: "2"
+            prometheus: "b"
+        node3:
+          ansible_host: 192.168.56.13
+          ansible_ssh_private_key_file: ".vagrant/machines/node3/virtualbox/private_key"
+          cluster_ip: 192.168.56.13
+          keepalived_priority: 50
+          swarm_labels:
+            cassandra: "3"
+            es: "3"
+            galera: "3"
+            minio: "true"
+            crowdsec_lapi: "true"
+            registry: "true"
+
+    # ---------------------------------------------------------------------
+    # NFS export of the GLPI files and of the backup metrics (ADR-0006).
+    # Moving this group to another host + `make deploy-apps` is the documented
+    # NFS failover procedure (docs/07-PRA.md).
+    # ---------------------------------------------------------------------
+    nfs_server:
+      hosts:
+        node1:
+
+    # ---------------------------------------------------------------------
+    # The node that bootstraps the Swarm. Must be a single host.
+    # ---------------------------------------------------------------------
+    swarm_bootstrap:
+      hosts:
+        node1:

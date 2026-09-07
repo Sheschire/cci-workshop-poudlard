@@ -1,0 +1,43 @@
+---
+# =============================================================================
+# Role `node-labels` — Swarm placement labels (CDC §5.3).
+#
+# Swarm has no StatefulSet: each member of a stateful cluster is modelled as a
+# distinct service pinned to one node by a label, with a *local* named volume.
+# These labels are what the `constraints:` of stacks/data.yml, backup.yml and
+# monitoring.yml resolve against.
+#
+#   node1  cassandra=1 es=1 galera=1 prometheus=a nfs=true
+#   node2  cassandra=2 es=2 galera=2 prometheus=b
+#   node3  cassandra=3 es=3 galera=3 minio=true crowdsec_lapi=true registry=true
+#
+# Replacing a node (docs/07-PRA.md) is: remove the dead node, join the new one,
+# re-run this role — the pinned services then reschedule onto it.
+# =============================================================================
+
+- name: Apply the Swarm placement labels
+  community.docker.docker_node:
+    hostname: "{{ inventory_hostname }}"
+    labels: "{{ swarm_labels | default({}) }}"
+    # Replace the whole label set so a label removed from the inventory is
+    # actually removed from the node (idempotent and authoritative).
+    labels_state: replace
+  delegate_to: "{{ groups['swarm_bootstrap'][0] }}"
+
+- name: Read back the labels
+  community.docker.docker_node_info:
+    name: "{{ inventory_hostname }}"
+  delegate_to: "{{ groups['swarm_bootstrap'][0] }}"
+  register: node_labels_node_info
+  changed_when: false
+
+- name: Assert that every expected label is set
+  ansible.builtin.assert:
+    that:
+      - node_labels_node_info.nodes[0].Spec.Labels[item.key] | default('') == item.value
+    fail_msg: >-
+      Label {{ item.key }}={{ item.value }} missing on {{ inventory_hostname }}.
+    quiet: true
+  loop: "{{ (swarm_labels | default({})) | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}={{ item.value }}"

@@ -1,0 +1,66 @@
+---
+# =============================================================================
+# Role `keepalived` — the floating VIP, installed *on the host* (ADR-0003).
+#
+# Keepalived is deliberately not containerised: it manipulates the host network
+# interfaces and it watches Docker, so making its lifetime depend on Docker
+# would be circular. It is, with the firewall and NFS, one of the three host
+# functions of the platform.
+#
+# Priorities: node1 150, node2 100, node3 50. A failed local Traefik costs 60
+# points (dw_keepalived_check_weight), which is enough to hand the VIP over:
+# 150 − 60 = 90 < 100.
+# =============================================================================
+
+- name: Install keepalived
+  ansible.builtin.apt:
+    name: keepalived
+    state: present
+
+- name: Install the Traefik health check script
+  ansible.builtin.copy:
+    dest: /usr/local/sbin/chk_traefik
+    mode: "0755"
+    owner: root
+    group: root
+    content: |
+      #!/usr/bin/env bash
+      # Managed by Ansible — dockerwarts.
+      # Keepalived runs this every 2 s. A non-zero exit costs the node
+      # {{ dw_keepalived_check_weight }} priority points, so a node whose local
+      # Traefik is unhealthy gives the VIP away instead of blackholing traffic.
+      #
+      # `/ping` is Traefik's own liveness endpoint, served on the `web`
+      # entrypoint (port 80) which is published in host mode on every node.
+      set -Eeuo pipefail
+      exec curl --silent --fail --max-time 1 --output /dev/null http://127.0.0.1/ping
+  notify: Restart keepalived
+
+- name: Deploy keepalived.conf
+  ansible.builtin.template:
+    src: keepalived.conf.j2
+    dest: /etc/keepalived/keepalived.conf
+    mode: "0640"
+    owner: root
+    group: root
+  notify: Restart keepalived
+
+- name: Enable and start keepalived
+  ansible.builtin.service:
+    name: keepalived
+    state: started
+    enabled: true
+
+- name: Apply pending keepalived changes now
+  ansible.builtin.meta: flush_handlers
+
+- name: Wait for one node to own the VIP
+  ansible.builtin.command: "ping -c 1 -W 2 {{ dw_vip }}"
+  register: keepalived_vip_ping
+  changed_when: false
+  retries: 15
+  delay: 2
+  until: keepalived_vip_ping.rc == 0
+  # Only assert once, from the bootstrap node: the VIP lives on exactly one
+  # host and every node can ping it, but a single check keeps the output clean.
+  run_once: true

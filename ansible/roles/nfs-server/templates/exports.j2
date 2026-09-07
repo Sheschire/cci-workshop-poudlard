@@ -1,0 +1,13 @@
+# Managed by Ansible — dockerwarts. Do not edit on the node.
+#
+# NFSv4 exports, reachable from the cluster subnet only (the host firewall also
+# restricts 2049/111 to {{ dw_cluster_cidr }}).
+#
+#   rw               GLPI writes attachments; backup jobs write .prom files
+#   sync             acknowledge a write only once it hit the disk
+#   no_subtree_check standard for whole-directory exports
+#   root_squash      root inside a container is not root on the export
+#   no_wdelay        small, atomically-written files (metrics)
+{% for export in dw_nfs_exports %}
+{{ export.path }} {{ dw_cluster_cidr }}(rw,sync,no_subtree_check,root_squash,no_wdelay,anonuid={{ export.owner }},anongid={{ export.group }})
+{% endfor %}
