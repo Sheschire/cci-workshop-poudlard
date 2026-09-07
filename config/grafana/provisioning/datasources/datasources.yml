@@ -1,0 +1,120 @@
+---
+# =============================================================================
+# Grafana — datasource provisioning (CDC §7.6).
+#
+# Mounted read-only at /etc/grafana/provisioning/datasources/. Grafana reads
+# this at every start and reconciles: a datasource is never created by hand,
+# so the two replicas are always identical and a rebuild is reproducible.
+#
+# The `uid` of each datasource is FIXED and stable. Every dashboard JSON
+# references these uids; letting Grafana generate them would produce different
+# uids on each replica and on each rebuild, and every panel would show
+# "Datasource not found". scripts/lib/check-grafana.py enforces the match in CI.
+# =============================================================================
+
+apiVersion: 1
+
+# Remove anything provisioned earlier under these names, so renaming a
+# datasource does not leave an orphan behind.
+deleteDatasources:
+  - name: Prometheus
+    orgId: 1
+
+datasources:
+  # ---------------------------------------------------------------------------
+  # Prometheus — the default datasource
+  #
+  # Points at the SERVICE name, so Swarm load-balances between the two
+  # replicas. They scrape the same targets, so either answers correctly; a
+  # graph may differ by one sample between refreshes, which is the documented
+  # cost of the HA model (see docs/04-composants/prometheus.md).
+  # ---------------------------------------------------------------------------
+  - name: Prometheus
+    uid: dw-prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      httpMethod: POST
+      # POST and not GET: a dashboard variable with many values produces a
+      # query longer than the URL limit, and Grafana silently fails on GET.
+      timeInterval: 15s
+      # Matches scrape_interval, so `$__rate_interval` computes a window that
+      # always contains at least two samples.
+      queryTimeout: 60s
+      prometheusType: Prometheus
+      prometheusVersion: 3.14.0
+      cacheLevel: Low
+
+  # ---------------------------------------------------------------------------
+  # Elasticsearch — logs
+  #
+  # Reaches the three nodes through the `data` overlay. Read-only account
+  # (role dw_reader): a compromised Grafana cannot alter the log history.
+  # ---------------------------------------------------------------------------
+  - name: Elasticsearch-Logs
+    uid: dw-es-logs
+    type: elasticsearch
+    access: proxy
+    url: http://es-1:9200
+    database: ""
+    editable: false
+    basicAuth: true
+    basicAuthUser: grafana
+    secureJsonData:
+      # Substituted from the secret by the entrypoint before Grafana starts.
+      basicAuthPassword: ${ES_GRAFANA_PASSWORD}
+    jsonData:
+      index: "logs-*"
+      timeField: "@timestamp"
+      esVersion: "8.19.0"
+      maxConcurrentShardRequests: 5
+      logMessageField: message
+      logLevelField: log_level
+      # These two are what turn the Logs panel from "a table of JSON" into a
+      # readable, colour-coded log view. They are the reason the Lua filter
+      # normalises log_level in the first place (config/fluent-bit).
+      interval: Daily
+      includeFrozen: false
+
+  # ---------------------------------------------------------------------------
+  # Elasticsearch — business data (the datalake)
+  #
+  # A SEPARATE datasource rather than one with a wildcard index: the two have
+  # different time fields semantics, different retention and different
+  # mappings, and a single datasource would force every datalake panel to
+  # filter the logs out by hand.
+  # ---------------------------------------------------------------------------
+  - name: Elasticsearch-Datalake
+    uid: dw-es-datalake
+    type: elasticsearch
+    access: proxy
+    url: http://es-1:9200
+    editable: false
+    basicAuth: true
+    basicAuthUser: grafana
+    secureJsonData:
+      basicAuthPassword: ${ES_GRAFANA_PASSWORD}
+    jsonData:
+      index: "datalake-events"
+      timeField: "@timestamp"
+      esVersion: "8.19.0"
+      maxConcurrentShardRequests: 5
+
+  # ---------------------------------------------------------------------------
+  # Alertmanager — so the active alerts are visible next to the metrics
+  #
+  # `tasks.alertmanager` would return all three; the service VIP is enough here
+  # because any member of the gossip cluster returns the same alert set.
+  # ---------------------------------------------------------------------------
+  - name: Alertmanager
+    uid: dw-alertmanager
+    type: alertmanager
+    access: proxy
+    url: http://alertmanager:9093
+    editable: false
+    jsonData:
+      implementation: prometheus
+      handleGrafanaManagedAlerts: false

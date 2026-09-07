@@ -1,0 +1,7 @@
+# alert2glpi — test dependencies.
+pytest==8.4.2
+pytest-asyncio==1.2.0
+# respx mocks httpx at the transport layer: the tests exercise the REAL client
+# code path (headers, JSON bodies, status handling) instead of a hand-written
+# stub that would only prove the stub works.
+respx==0.22.0

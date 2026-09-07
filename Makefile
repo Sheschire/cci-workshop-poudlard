@@ -208,9 +208,9 @@ lint-shell: ## shellcheck over every shell script
 lint-docker: ## hadolint over every Dockerfile
 	@find $(ROOT)/images -name Dockerfile -print0 | xargs -0 -r hadolint
 
-lint-python: ## ruff over the home-made Python services
-	ruff check $(ROOT)/images
-	ruff format --check $(ROOT)/images
+lint-python: ## ruff over the Python code (services + shared tooling)
+	ruff check $(ROOT)/images $(SCRIPTS)/lib
+	ruff format --check $(ROOT)/images $(SCRIPTS)/lib
 
 lint-prom: ## promtool / amtool checks (same script as the CI)
 	$(SCRIPTS)/validate-configs.sh

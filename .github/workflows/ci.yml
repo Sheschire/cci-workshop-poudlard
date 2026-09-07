@@ -68,12 +68,10 @@ jobs:
       - name: ruff
         run: |
           # `images/` appears with the first home-made image (phase 2).
-          if [ -d images ]; then
-            ruff check images
-            ruff format --check images
-          else
-            echo "::notice::images/ does not exist yet"
-          fi
+          targets="scripts/lib"
+          [ -d images ] && targets="images $targets"
+          ruff check $targets
+          ruff format --check $targets
 
   # ---------------------------------------------------------------------------
   validate:

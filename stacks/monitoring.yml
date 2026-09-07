@@ -1,0 +1,731 @@
+---
+# =============================================================================
+# Dockerwarts N°1 — monitoring stack (CDC §7.6).
+#
+#   scripts/deploy.sh monitoring        (make deploy-monitoring)
+#
+# Contents
+#   prometheus            2 identical replicas, HA by duplication
+#   alertmanager          3 replicas, gossip cluster, deduplicates
+#   grafana               2 replicas, shared state in Galera (ADR-0005)
+#   alert2glpi            the alert → GLPI ticket bridge (ADR-0009)
+#   node-exporter         global, host metrics
+#   cadvisor              global, container metrics
+#   blackbox-exporter     availability from OUTSIDE, through the VIP
+#   mysqld-exporter       multi-target, probes the three Galera members
+#   elasticsearch-exporter
+#
+# Deployed AFTER the applications: Prometheus discovers its targets through the
+# Swarm API, and alert2glpi needs GLPI to exist to authenticate against it.
+#
+# Documented in docs/04-composants/{prometheus,alertmanager,grafana,alert2glpi}.md
+# =============================================================================
+version: "3.8"
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-restart: &default-restart
+  condition: on-failure
+  delay: 10s
+  max_attempts: 0
+
+x-hardening: &hardening
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+
+services:
+
+  # ===========================================================================
+  # Prometheus — 2 identical replicas
+  #
+  # No clustering, no shared storage: both scrape the same targets and keep
+  # their own local TSDB. That is the officially recommended HA pattern and the
+  # simplest thing that survives a node loss. Alertmanager deduplicates the
+  # duplicate alerts, so the operator sees one alert and gets one ticket.
+  #
+  # Pinned to the two nodes carrying `prometheus=a` and `prometheus=b`, because
+  # each replica's data is a LOCAL volume: a reschedule elsewhere would start
+  # with an empty TSDB.
+  # ===========================================================================
+  prometheus:
+    image: prom/prometheus:v3.14.0@sha256:5ce7540c3c00ef4ab0c9d2c995c6a5b9c421f44b4a115d97a2c7af3b1c21cbb0
+    <<: *hardening
+    user: "65534:65534"      # nobody, as the image intends
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+      - "--storage.tsdb.retention.size=10GB"
+      # Both bounds: whichever is reached first wins. Size alone would let a
+      # quiet month keep a year of data; time alone would let a busy week fill
+      # the disk.
+      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+      - "--web.console.templates=/usr/share/prometheus/consoles"
+      - "--web.external-url=https://prometheus.${DOMAIN}"
+      # Needed for the links in alerts and in the Alertmanager UI to be
+      # clickable from outside the cluster.
+      - "--web.enable-lifecycle"
+      # Allows POST /-/reload: a configuration change applies without losing
+      # the in-memory state.
+      - "--web.enable-admin-api"
+      # Required by the `backup-prometheus` job, which takes a TSDB snapshot
+      # through POST /api/v1/admin/tsdb/snapshot.
+      - "--log.format=json"
+    environment:
+      # Written into `external_labels.replica`, which is how Alertmanager tells
+      # the two instances apart when deduplicating.
+      HOSTNAME: "{{.Node.Hostname}}"
+      TZ: "${TZ}"
+    volumes:
+      - type: volume
+        source: prometheus_data
+        target: /prometheus
+    configs:
+      - source: prometheus_config
+        target: /etc/prometheus/prometheus.yml
+        mode: 292
+      - source: rules_infrastructure
+        target: /etc/prometheus/rules/infrastructure.yml
+        mode: 292
+      - source: rules_datastores
+        target: /etc/prometheus/rules/datastores.yml
+        mode: 292
+      - source: rules_backup
+        target: /etc/prometheus/rules/backup.yml
+        mode: 292
+    networks:
+      - monitoring   # scrapes the exporters
+      - mgmt         # reaches docker-socket-proxy for service discovery
+      - data         # scrapes the datastore exporters
+      - edge         # so Traefik can route the UI
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    deploy:
+      mode: replicated
+      replicas: 2
+      placement:
+        constraints:
+          - node.labels.prometheus != ""
+        max_replicas_per_node: 1
+      resources:
+        limits:
+          cpus: "1.00"
+          memory: 2G
+        reservations:
+          cpus: "0.10"
+          memory: 512M
+      restart_policy: *default-restart
+      update_config:
+        parallelism: 1
+        order: stop-first     # a local TSDB: never two writers on one volume
+        failure_action: rollback
+        delay: 30s
+      labels:
+        traefik.enable: "true"
+        traefik.swarm.network: "edge"
+        traefik.http.routers.prometheus.rule: "Host(`prometheus.${DOMAIN}`)"
+        traefik.http.routers.prometheus.entrypoints: "websecure"
+        traefik.http.routers.prometheus.tls: "true"
+        traefik.http.routers.prometheus.tls.options: "modern@file"
+        # allowlist + basic-auth: Prometheus has NO authentication of its own,
+        # and its UI exposes every metric of the platform.
+        traefik.http.routers.prometheus.middlewares: "admin-chain@file"
+        traefik.http.routers.prometheus.service: "prometheus"
+        traefik.http.services.prometheus.loadbalancer.server.port: "9090"
+    logging: *default-logging
+
+  # ===========================================================================
+  # Alertmanager — 3 replicas forming a gossip cluster
+  #
+  # The cluster is what makes deduplication work: the three members share which
+  # notifications have already been sent, so an alert received by all three
+  # produces ONE ticket. Losing one still leaves a quorum.
+  # ===========================================================================
+  alertmanager:
+    image: prom/alertmanager:v0.28.1@sha256:27c475db5fb156cab31d5c18a4251ac7ed567746a2483ff264516437a39b15ba
+    <<: *hardening
+    user: "65534:65534"
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--storage.path=/alertmanager"
+      - "--web.external-url=https://alertmanager.${DOMAIN}"
+      - "--cluster.listen-address=0.0.0.0:9094"
+      # `tasks.alertmanager` is Swarm's DNS name returning the A records of
+      # every task. Each replica therefore discovers the other two without any
+      # static list to maintain when they are rescheduled.
+      - "--cluster.peer=tasks.alertmanager:9094"
+      - "--cluster.pushpull-interval=60s"
+      - "--log.format=json"
+    environment:
+      TZ: "${TZ}"
+    volumes:
+      - type: volume
+        source: alertmanager_data
+        target: /alertmanager
+    configs:
+      - source: alertmanager_config
+        target: /etc/alertmanager/alertmanager.yml
+        mode: 292
+    networks:
+      - monitoring
+      - edge
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9093/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    deploy:
+      mode: replicated
+      replicas: 3
+      placement:
+        max_replicas_per_node: 1
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 256M
+        reservations:
+          cpus: "0.02"
+          memory: 64M
+      restart_policy: *default-restart
+      update_config:
+        parallelism: 1
+        order: start-first
+        failure_action: rollback
+        delay: 20s
+      labels:
+        prometheus.job: "alertmanager"
+        prometheus.port: "9093"
+        traefik.enable: "true"
+        traefik.swarm.network: "edge"
+        traefik.http.routers.alertmanager.rule: "Host(`alertmanager.${DOMAIN}`)"
+        traefik.http.routers.alertmanager.entrypoints: "websecure"
+        traefik.http.routers.alertmanager.tls: "true"
+        traefik.http.routers.alertmanager.tls.options: "modern@file"
+        traefik.http.routers.alertmanager.middlewares: "admin-chain@file"
+        traefik.http.routers.alertmanager.service: "alertmanager"
+        traefik.http.services.alertmanager.loadbalancer.server.port: "9093"
+    logging: *default-logging
+
+  # ===========================================================================
+  # Grafana — 2 replicas sharing their state in Galera
+  #
+  # This is the service that justifies the `grafana` database (ADR-0005). With
+  # the default SQLite, each replica would have its own sessions, dashboards
+  # and users: a user would be logged out on every other request.
+  # ===========================================================================
+  grafana:
+    image: grafana/grafana:12.4.10@sha256:c132a683b2430fff9115a29b2a79c8ab97540cdcc90846e3c81878c778ca3596
+    <<: *hardening
+    user: "472:472"          # the `grafana` user of the official image
+    entrypoint:
+      - /usr/local/bin/secrets-entrypoint.sh
+      - /run.sh
+    environment:
+      # Turned into GF_* variables by the generic bridge: none of these values
+      # may live in a Swarm config object, which any manager can read.
+      GF_SECURITY_ADMIN_PASSWORD_FILE: /run/secrets/dw_grafana_admin_password
+      GF_SECURITY_SECRET_KEY_FILE: /run/secrets/dw_grafana_secret_key
+      GF_DATABASE_PASSWORD_FILE: /run/secrets/dw_mariadb_grafana_password
+      # Substituted into datasources.yml by Grafana's own provisioning, which
+      # expands ${VAR} from the environment.
+      ES_GRAFANA_PASSWORD_FILE: /run/secrets/dw_es_grafana_password
+      GF_PATHS_PROVISIONING: /etc/grafana/provisioning
+      TZ: "${TZ}"
+    volumes:
+      # Only the plugin directory and the PNG render cache: the real state is
+      # in Galera, which is what makes the two replicas interchangeable.
+      - type: volume
+        source: grafana_data
+        target: /var/lib/grafana/plugins
+    configs:
+      - source: secrets_entrypoint
+        target: /usr/local/bin/secrets-entrypoint.sh
+        mode: 365
+      - source: grafana_ini
+        target: /etc/grafana/grafana.ini
+        mode: 292
+      - source: grafana_datasources
+        target: /etc/grafana/provisioning/datasources/datasources.yml
+        mode: 292
+      - source: grafana_dashboards_provider
+        target: /etc/grafana/provisioning/dashboards/dashboards.yml
+        mode: 292
+      # The twelve dashboards, one config object each. Swarm configs are files,
+      # not directories, so each is mounted individually — which also means a
+      # single dashboard change rolls the service with a readable diff.
+      - {source: dash_01, target: /var/lib/grafana/dashboards/01-overview.json, mode: 292}
+      - {source: dash_02, target: /var/lib/grafana/dashboards/02-nodes.json, mode: 292}
+      - {source: dash_03, target: /var/lib/grafana/dashboards/03-containers.json, mode: 292}
+      - {source: dash_04, target: /var/lib/grafana/dashboards/04-traefik.json, mode: 292}
+      - {source: dash_05, target: /var/lib/grafana/dashboards/05-security.json, mode: 292}
+      - {source: dash_06, target: /var/lib/grafana/dashboards/06-elasticsearch.json, mode: 292}
+      - {source: dash_07, target: /var/lib/grafana/dashboards/07-cassandra.json, mode: 292}
+      - {source: dash_08, target: /var/lib/grafana/dashboards/08-galera.json, mode: 292}
+      - {source: dash_09, target: /var/lib/grafana/dashboards/09-availability.json, mode: 292}
+      - {source: dash_10, target: /var/lib/grafana/dashboards/10-backup.json, mode: 292}
+      - {source: dash_11, target: /var/lib/grafana/dashboards/11-logs.json, mode: 292}
+      - {source: dash_12, target: /var/lib/grafana/dashboards/12-datalake.json, mode: 292}
+    secrets:
+      - dw_grafana_admin_password
+      - dw_grafana_secret_key
+      - dw_mariadb_grafana_password
+      - dw_es_grafana_password
+    networks:
+      - monitoring   # Prometheus and Alertmanager datasources
+      - data         # db-proxy (state) and es-1 (log datasources)
+      - edge         # Traefik
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:3000/api/health | grep -q ok || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    deploy:
+      mode: replicated
+      replicas: 2
+      placement:
+        max_replicas_per_node: 1
+      resources:
+        limits:
+          cpus: "0.75"
+          memory: 768M
+        reservations:
+          cpus: "0.05"
+          memory: 128M
+      restart_policy: *default-restart
+      update_config:
+        parallelism: 1
+        order: start-first     # stateless replicas: no downtime
+        failure_action: rollback
+      labels:
+        prometheus.job: "grafana"
+        prometheus.port: "3000"
+        traefik.enable: "true"
+        traefik.swarm.network: "edge"
+        traefik.http.routers.grafana.rule: "Host(`grafana.${DOMAIN}`)"
+        traefik.http.routers.grafana.entrypoints: "websecure"
+        traefik.http.routers.grafana.tls: "true"
+        traefik.http.routers.grafana.tls.options: "modern@file"
+        # No allowlist: Grafana is a user-facing service that authenticates its
+        # own users, like GLPI.
+        traefik.http.routers.grafana.middlewares: "app-chain@file"
+        traefik.http.routers.grafana.service: "grafana"
+        traefik.http.services.grafana.loadbalancer.server.port: "3000"
+    logging: *default-logging
+
+  # ===========================================================================
+  # alert2glpi — the alert → ticket bridge (ADR-0009)
+  # ===========================================================================
+  alert2glpi:
+    image: ${REGISTRY}/dockerwarts/alert2glpi:${IMAGE_TAG}
+    <<: *hardening
+    read_only: true
+    # The image writes nothing: PYTHONDONTWRITEBYTECODE is set in the
+    # Dockerfile precisely so that this works.
+    tmpfs:
+      - /tmp:size=16M
+    environment:
+      GLPI_URL: "http://glpi-web/apirest.php"
+      # The internal service name, not the public URL: no reason to leave the
+      # overlay and come back through Traefik for an internal API call.
+      GLPI_APP_TOKEN_FILE: /run/secrets/dw_glpi_app_token
+      GLPI_USER_TOKEN_FILE: /run/secrets/dw_glpi_user_token
+      GRAFANA_URL: "https://grafana.${DOMAIN}"
+      LOG_LEVEL: INFO
+      TZ: "${TZ}"
+    secrets:
+      - dw_glpi_app_token
+      - dw_glpi_user_token
+    networks:
+      - monitoring   # receives the Alertmanager webhook
+      - data         # reaches glpi-web
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    deploy:
+      mode: replicated
+      replicas: 1
+      # ONE replica on purpose: the deduplication counters live in the process
+      # memory, and two replicas would each hold half of them. Deduplication
+      # itself is safe either way (it queries GLPI), but /metrics would report
+      # whichever replica answered the scrape.
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 192M
+        reservations:
+          cpus: "0.02"
+          memory: 64M
+      restart_policy: *default-restart
+      update_config:
+        parallelism: 1
+        order: start-first
+        failure_action: rollback
+      labels:
+        prometheus.job: "alert2glpi"
+        prometheus.port: "8080"
+    logging: *default-logging
+
+  # ===========================================================================
+  # node-exporter — host metrics, one task per node
+  #
+  # It measures the HOST, so it needs read-only access to the host's /proc,
+  # /sys and /. That is the reason for the three bind mounts, and they are the
+  # only ones in this stack.
+  # ===========================================================================
+  node-exporter:
+    image: prom/node-exporter:v1.12.1@sha256:1b4e4438faca4dd7e001dd445d161a4a2091b0fededa84093b3a8dfeae1f1be0
+    <<: *hardening
+    user: "65534:65534"
+    command:
+      - "--path.procfs=/host/proc"
+      - "--path.sysfs=/host/sys"
+      - "--path.rootfs=/host/root"
+      # Without these three, the exporter would report the CONTAINER's metrics:
+      # its cgroup memory, its overlay filesystem. Useless, and quietly wrong.
+      - "--collector.filesystem.mount-points-exclude=^/(dev|proc|sys|run|var/lib/docker/.+)($$|/)"
+      - "--collector.filesystem.fs-types-exclude=^(autofs|binfmt_misc|cgroup.*|devpts|overlay|proc|squashfs|sysfs|tmpfs)$$"
+      # Excluding Docker's own mounts is what keeps NodeDiskFillingUp from
+      # firing on every container layer.
+      - "--collector.textfile.directory=/host/textfile"
+      - "--no-collector.wifi"
+      - "--no-collector.hwmon"
+      - "--no-collector.infiniband"
+      - "--web.listen-address=:9100"
+    volumes:
+      - {type: bind, source: /proc, target: /host/proc, read_only: true}
+      - {type: bind, source: /sys, target: /host/sys, read_only: true}
+      - {type: bind, source: /, target: /host/root, read_only: true}
+    networks:
+      - monitoring
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9100/metrics"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      mode: global
+      resources:
+        limits:
+          cpus: "0.20"
+          memory: 128M
+        reservations:
+          cpus: "0.01"
+          memory: 32M
+      restart_policy: *default-restart
+      update_config: {parallelism: 1, order: start-first, failure_action: rollback}
+      labels:
+        prometheus.job: "node-exporter"
+        prometheus.port: "9100"
+    logging: *default-logging
+
+  # ===========================================================================
+  # cAdvisor — container metrics, one task per node
+  #
+  # The one service in the platform that needs real privileges: it reads the
+  # cgroup hierarchy and the container runtime state of its host. That is why
+  # its capabilities are added back explicitly rather than left at the default.
+  # ===========================================================================
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.55.1@sha256:3de2bd5203120b866d74a9b283b2ffb8ec382fbf9dc321814700c6ea6f44ec57
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      # SYS_PTRACE + DAC_READ_SEARCH: read the cgroup files and the process
+      # namespaces of containers owned by root. Strictly less than the
+      # `privileged: true` that cAdvisor is usually deployed with.
+      - SYS_PTRACE
+      - DAC_READ_SEARCH
+    command:
+      - "--housekeeping_interval=15s"
+      - "--docker_only=true"
+      # Only containers, not every cgroup on the host: halves the series count.
+      - "--store_container_labels=false"
+      - "--whitelisted_container_labels=com.docker.swarm.service.name,com.docker.swarm.task.name,com.docker.stack.namespace"
+      # An allow-list of labels: without it cAdvisor turns EVERY container
+      # label into a metric label, which is the classic cardinality explosion.
+      - "--disable_metrics=percpu,sched,tcp,udp,advtcp,process,hugetlb,referenced_memory,cpu_topology,resctrl"
+    volumes:
+      - {type: bind, source: /, target: /rootfs, read_only: true}
+      - {type: bind, source: /var/run, target: /var/run, read_only: true}
+      - {type: bind, source: /sys, target: /sys, read_only: true}
+      - {type: bind, source: /var/lib/docker, target: /var/lib/docker, read_only: true}
+      - {type: bind, source: /dev/disk, target: /dev/disk, read_only: true}
+    networks:
+      - monitoring
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    deploy:
+      mode: global
+      resources:
+        limits:
+          cpus: "0.30"
+          memory: 256M
+        reservations:
+          cpus: "0.02"
+          memory: 64M
+      restart_policy: *default-restart
+      update_config: {parallelism: 1, order: start-first, failure_action: rollback}
+      labels:
+        prometheus.job: "cadvisor"
+        prometheus.port: "8080"
+    logging: *default-logging
+
+  # ===========================================================================
+  # blackbox-exporter — availability from OUTSIDE
+  # ===========================================================================
+  blackbox-exporter:
+    image: prom/blackbox-exporter:v0.28.0@sha256:e753ff9f3fc458d02cca5eddab5a77e1c175eee484a8925ac7d524f04366c2fc
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      # The ONLY capability, and the reason it exists: an ICMP probe needs a
+      # raw socket. Without it, VipUnreachable could never be evaluated.
+      - NET_RAW
+    command:
+      - "--config.file=/config/blackbox.yml"
+      - "--log.format=json"
+    configs:
+      - source: blackbox_config
+        target: /config/blackbox.yml
+        mode: 292
+    secrets:
+      # The internal CA, so the probes VALIDATE the certificate. Without it,
+      # `probe_ssl_earliest_cert_expiry` would not exist and
+      # CertificateExpiringSoon could never fire.
+      - dw_ca_cert
+    networks:
+      - monitoring
+      - edge         # to reach the VIP and the public URLs
+      - data         # for the tcp_connect probes on db-proxy, es-1, cassandra-1
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9115/-/healthy"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      mode: replicated
+      replicas: 1
+      resources:
+        limits:
+          cpus: "0.20"
+          memory: 128M
+        reservations:
+          cpus: "0.01"
+          memory: 32M
+      restart_policy: *default-restart
+      update_config: {parallelism: 1, order: start-first, failure_action: rollback}
+      labels:
+        prometheus.job: "blackbox"
+        prometheus.port: "9115"
+    logging: *default-logging
+
+  # ===========================================================================
+  # mysqld-exporter — multi-target, probes the three Galera members
+  #
+  # One instance rather than three: `--config.my-cnf` plus the `/probe`
+  # endpoint lets Prometheus pass the target per scrape. Three exporters would
+  # mean three containers and three copies of the same credential.
+  # ===========================================================================
+  mysqld-exporter:
+    image: prom/mysqld-exporter:v0.20.0@sha256:abed8dac117b4ae5b70757f988e44795935b9a72c3b58d720c67ba688f8cb79e
+    <<: *hardening
+    user: "65534:65534"
+    entrypoint:
+      - /usr/local/bin/secrets-entrypoint.sh
+      - /bin/sh
+      - -c
+      # The exporter reads its credentials from a my.cnf file, so the password
+      # is materialised in a tmpfs at start-up and never written to disk.
+      - |
+        set -eu
+        umask 077
+        printf '[client]\nuser=exporter\npassword=%s\n' "$$MYSQL_PASSWORD" > /tmp/.my.cnf
+        exec /bin/mysqld_exporter \
+          --config.my-cnf=/tmp/.my.cnf \
+          --mysqld.address=galera-1:3306 \
+          --collect.global_status \
+          --collect.global_variables \
+          --collect.info_schema.innodb_metrics \
+          --collect.slave_status=false \
+          --web.listen-address=:9104
+    environment:
+      MYSQL_PASSWORD_FILE: /run/secrets/dw_mariadb_exporter_password
+      TZ: "${TZ}"
+    tmpfs:
+      - /tmp:size=1M
+    configs:
+      - source: secrets_entrypoint
+        target: /usr/local/bin/secrets-entrypoint.sh
+        mode: 365
+    secrets:
+      - dw_mariadb_exporter_password
+    networks:
+      - data
+      - monitoring
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9104/metrics"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    deploy:
+      mode: replicated
+      replicas: 1
+      resources:
+        limits:
+          cpus: "0.20"
+          memory: 128M
+        reservations:
+          cpus: "0.01"
+          memory: 32M
+      restart_policy: *default-restart
+      update_config: {parallelism: 1, order: start-first, failure_action: rollback}
+    logging: *default-logging
+
+  # ===========================================================================
+  # elasticsearch-exporter
+  # ===========================================================================
+  elasticsearch-exporter:
+    image: prometheuscommunity/elasticsearch-exporter:v1.11.0@sha256:a056739b095df4baaa076f0b31321394233da9a240eeada2623d1b028b7ee7a6
+    <<: *hardening
+    user: "65534:65534"
+    entrypoint:
+      - /usr/local/bin/secrets-entrypoint.sh
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        exec /bin/elasticsearch_exporter \
+          --es.uri="http://exporter:$$ES_EXPORTER_PASSWORD@es-1:9200" \
+          --es.all --es.indices --es.indices_settings --es.shards \
+          --es.snapshots --es.slm --es.cluster_settings \
+          --web.listen-address=:9114
+    environment:
+      ES_EXPORTER_PASSWORD_FILE: /run/secrets/dw_es_exporter_password
+      TZ: "${TZ}"
+    configs:
+      - source: secrets_entrypoint
+        target: /usr/local/bin/secrets-entrypoint.sh
+        mode: 365
+    secrets:
+      - dw_es_exporter_password
+    networks:
+      - data
+      - monitoring
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9114/metrics"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    deploy:
+      mode: replicated
+      replicas: 1
+      resources:
+        limits:
+          cpus: "0.20"
+          memory: 192M
+        reservations:
+          cpus: "0.01"
+          memory: 32M
+      restart_policy: *default-restart
+      update_config: {parallelism: 1, order: start-first, failure_action: rollback}
+      labels:
+        prometheus.job: "elasticsearch"
+        prometheus.port: "9114"
+    logging: *default-logging
+
+configs:
+  prometheus_config:
+    name: "prometheus_config-${CONFIG_HASH_PROMETHEUS}"
+    file: ../.rendered/prometheus.yml
+  rules_infrastructure:
+    name: "rules_infra-${CONFIG_HASH_RULES_INFRA}"
+    file: ../.rendered/rules-infrastructure.yml
+  rules_datastores:
+    name: "rules_data-${CONFIG_HASH_RULES_DATASTORES}"
+    file: ../.rendered/rules-datastores.yml
+  rules_backup:
+    name: "rules_backup-${CONFIG_HASH_RULES_BACKUP}"
+    file: ../.rendered/rules-backup.yml
+  alertmanager_config:
+    name: "alertmanager_config-${CONFIG_HASH_ALERTMANAGER}"
+    file: ../.rendered/alertmanager.yml
+  blackbox_config:
+    name: "blackbox_config-${CONFIG_HASH_BLACKBOX}"
+    file: ../.rendered/blackbox.yml
+  grafana_ini:
+    name: "grafana_ini-${CONFIG_HASH_GRAFANA_INI}"
+    file: ../.rendered/grafana.ini
+  grafana_datasources:
+    name: "grafana_ds-${CONFIG_HASH_GRAFANA_PROV}"
+    file: ../config/grafana/provisioning/datasources/datasources.yml
+  grafana_dashboards_provider:
+    name: "grafana_dashprov-${CONFIG_HASH_GRAFANA_PROV}"
+    file: ../config/grafana/provisioning/dashboards/dashboards.yml
+  secrets_entrypoint:
+    name: "secrets_entrypoint-${CONFIG_HASH_SECRETS_ENTRYPOINT}"
+    file: ../config/common/secrets-entrypoint.sh
+  # All twelve dashboards share one content hash (the directory), so editing
+  # any of them rolls Grafana once rather than twelve times.
+  dash_01: {name: "dash_01-${CONFIG_HASH_GRAFANA_DASH}", file: ../config/grafana/dashboards/01-overview.json}
+  dash_02: {name: "dash_02-${CONFIG_HASH_GRAFANA_DASH}", file: ../config/grafana/dashboards/02-nodes.json}
+  dash_03: {name: "dash_03-${CONFIG_HASH_GRAFANA_DASH}", file: ../config/grafana/dashboards/03-containers.json}
+  dash_04: {name: "dash_04-${CONFIG_HASH_GRAFANA_DASH}", file: ../config/grafana/dashboards/04-traefik.json}
+  dash_05: {name: "dash_05-${CONFIG_HASH_GRAFANA_DASH}", file: ../config/grafana/dashboards/05-security.json}
+  dash_06: {name: "dash_06-${CONFIG_HASH_GRAFANA_DASH}", file: ../config/grafana/dashboards/06-elasticsearch.json}
+  dash_07: {name: "dash_07-${CONFIG_HASH_GRAFANA_DASH}", file: ../config/grafana/dashboards/07-cassandra.json}
+  dash_08: {name: "dash_08-${CONFIG_HASH_GRAFANA_DASH}", file: ../config/grafana/dashboards/08-galera.json}
+  dash_09: {name: "dash_09-${CONFIG_HASH_GRAFANA_DASH}", file: ../config/grafana/dashboards/09-availability.json}
+  dash_10: {name: "dash_10-${CONFIG_HASH_GRAFANA_DASH}", file: ../config/grafana/dashboards/10-backup.json}
+  dash_11: {name: "dash_11-${CONFIG_HASH_GRAFANA_DASH}", file: ../config/grafana/dashboards/11-logs.json}
+  dash_12: {name: "dash_12-${CONFIG_HASH_GRAFANA_DASH}", file: ../config/grafana/dashboards/12-datalake.json}
+
+secrets:
+  dw_grafana_admin_password: {external: true}
+  dw_grafana_secret_key: {external: true}
+  dw_mariadb_grafana_password: {external: true}
+  dw_mariadb_exporter_password: {external: true}
+  dw_es_grafana_password: {external: true}
+  dw_es_exporter_password: {external: true}
+  dw_glpi_app_token: {external: true}
+  dw_glpi_user_token: {external: true}
+  dw_ca_cert: {external: true}
+
+volumes:
+  # Local: each Prometheus replica keeps its own TSDB, which is the whole
+  # point of the HA-by-duplication model.
+  prometheus_data: {driver: local}
+  alertmanager_data: {driver: local}
+  grafana_data: {driver: local}
+
+networks:
+  monitoring: {external: true}
+  mgmt: {external: true}
+  data: {external: true}
+  edge: {external: true}

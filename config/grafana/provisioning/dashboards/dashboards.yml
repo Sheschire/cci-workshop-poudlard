@@ -1,0 +1,29 @@
+---
+# =============================================================================
+# Grafana — dashboard provisioning (CDC §7.6).
+#
+# The twelve dashboards are JSON files committed to git and mounted read-only.
+# Nothing is created through the UI: a dashboard that only exists in the
+# database is lost on a restore and cannot be reviewed in a diff.
+# =============================================================================
+
+apiVersion: 1
+
+providers:
+  - name: dockerwarts
+    orgId: 1
+    folder: Dockerwarts
+    folderUid: dw-folder
+    type: file
+    # `true` would let a user save changes into the database, where they would
+    # silently diverge from git and be lost on the next rebuild. `false` makes
+    # the UI read-only for these dashboards: the way to change one is to edit
+    # the JSON and redeploy.
+    disableDeletion: true
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
+      # Keeps the on-disk layout as the folder structure, so adding a
+      # sub-directory later organises the UI without any config change.
+      foldersFromFilesStructure: false

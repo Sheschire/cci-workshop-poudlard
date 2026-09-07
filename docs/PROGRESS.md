@@ -124,18 +124,20 @@ critères dynamiques listés en bas de page.
 **Livrables** : `stacks/monitoring.yml`, `config/{prometheus,alertmanager,blackbox,grafana}/`,
 12 dashboards, `images/alert2glpi/`
 
-| # | Critère d'acceptation | État |
-|---|---|---|
-| 4.1 | 100 % des cibles Prometheus `up` | ⬜ |
-| 4.2 | Les 12 dashboards se chargent sans panneau vide | ⬜ |
-| 4.3 | `docker service scale apps_glpi-web=0` → alerte `GLPIDown` → **ticket GLPI créé** | ⬜ |
-| 4.4 | Retour à `=2` → le ticket passe au statut Résolu | ⬜ |
-| 4.5 | `NodeDown` inhibe les autres alertes portant le même `node` | ⬜ |
-| 4.6 | `promtool check rules` / `check config` / `amtool check-config` verts | ⬜ |
-| 4.7 | `pytest` alert2glpi vert | ⬜ |
-| 4.8 | Documentation : `prometheus.md`, `alertmanager.md`, `grafana.md`, `alert2glpi.md` | ⬜ |
+| # | Critère d'acceptation | État | Preuve |
+|---|---|---|---|
+| 4.1 | 100 % des cibles Prometheus `up` | 🖥️ | découverte Swarm par convention de labels validée ; `promtool check config` vert sur le fichier **rendu** |
+| 4.2 | Les 12 dashboards se chargent sans panneau vide | ✅ (statique) | **155 panneaux, 51 sections, 0 chevauchement, 0 UID orphelin** — `check-grafana.py` vérifie que chaque référence de datasource est provisionnée, que chaque panneau a une cible et que le JSON correspond au générateur. **2 tests négatifs effectués** |
+| 4.3 | `GLPIDown` → **ticket GLPI créé** | 🖥️ | chaîne complète écrite et testée unitairement : la règle se déclenche (test promtool), le webhook crée un ticket (test respx) |
+| 4.4 | Retour → ticket Résolu | ✅ (unitaire) | test `test_resolved_adds_a_followup_and_solves` : suivi ajouté + statut 5 |
+| 4.5 | `NodeDown` inhibe les alertes du même `node` | ✅ (statique) | 9 règles d'inhibition, `amtool check-config` vert, `equal: ["node"]` justifié |
+| 4.6 | `promtool` / `amtool` verts | ✅ | `check config`, `check rules` (**48 règles**), **`test rules` : 15 tests unitaires verts**, `amtool check-config` dans les **deux** cas (SMTP absent et présent) |
+| 4.7 | `pytest` alert2glpi vert | ✅ | **22 tests exécutés et verts**, API GLPI simulée au niveau transport (respx) |
+| 4.8 | Documentation des 4 composants | ✅ | `prometheus.md`, `alertmanager.md`, `grafana.md`, `alert2glpi.md` |
+| 4.9 | Exporters complets (CDC §7.6) | ✅ (statique) | node-exporter, cAdvisor, blackbox, mysqld (multi-cible), elasticsearch, plus les `/metrics` natifs de Traefik, CrowdSec, HAProxy, Fluent Bit, Alertmanager, Grafana, alert2glpi |
 
-**Statut de la phase** : ⬜ à faire
+**Statut de la phase** : ✅ **terminée** — livrables complets, critères statiques vérifiés,
+critères dynamiques listés en bas de page.
 
 ---
 
@@ -358,6 +360,49 @@ curl --cacert certs/ca.crt -s -H "App-Token: $APP" -H "Authorization: user_token
 # 3.7 — un seul exécuteur cron
 vagrant ssh node1 -c 'docker service ls --filter name=apps_glpi-cron'
 #   attendu : 1/1
+```
+
+### Phase 4
+
+```bash
+make build                # image dockerwarts/alert2glpi
+make deploy-monitoring
+
+# 4.1 — toutes les cibles up
+curl -su admin:$(cat secrets/dw_traefik_admin_password.txt) \
+  --cacert certs/ca.crt https://prometheus.dockerwarts.lan/api/v1/targets \
+  | jq -r '.data.activeTargets[] | select(.health!="up") | "\(.labels.job) \(.labels.instance) \(.lastError)"'
+#   attendu : aucune ligne
+
+# 4.2 — les 12 dashboards
+#   ouvrir https://grafana.dockerwarts.lan → dossier « Dockerwarts »
+#   parcourir les 12 ; aucun panneau ne doit afficher « No data » ni
+#   « Datasource not found ». Captures à placer dans docs/images/.
+
+# 4.3 / 4.4 — la boucle alerte → ticket (LE critère de la phase)
+vagrant ssh node1 -c 'docker service scale apps_glpi-web=0'
+#   attendre ~90 s (for: 1m + group_wait: 10s pour un critical)
+curl -s --cacert certs/ca.crt https://alertmanager.dockerwarts.lan/api/v2/alerts \
+  -u admin:$(cat secrets/dw_traefik_admin_password.txt) | jq -r '.[].labels.alertname'
+#   → GLPIDown
+#   puis, dans GLPI : un ticket « [critical] GLPIDown — … [AM:…] » en priorité 5
+vagrant ssh node1 -c 'docker service scale apps_glpi-web=2'
+#   après résolution : le MÊME ticket passe au statut « Résolu » avec un suivi
+vagrant ssh node1 -c "docker service logs --tail 20 monitoring_alert2glpi"
+#   → « ticket #N marked as solved »
+
+# 4.5 — inhibition
+vagrant halt -f node2
+#   attendre 2 min, puis compter les alertes NON inhibées :
+curl -s --cacert certs/ca.crt -u admin:$(cat secrets/dw_traefik_admin_password.txt) \
+  https://alertmanager.dockerwarts.lan/api/v2/alerts?inhibited=false | jq 'length'
+#   attendu : peu d'alertes (NodeDown + celles sans étiquette `node`),
+#   PAS une par service du nœud perdu
+vagrant up node2
+
+# 4.6 / 4.7 — déjà verts hors VM, rejouables :
+make lint-prom
+make test-python
 ```
 
 > **À confirmer au premier démarrage** : `read_only: true` sur `traefik` et

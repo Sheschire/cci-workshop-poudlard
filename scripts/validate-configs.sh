@@ -19,6 +19,15 @@ cd "$DW_ROOT"
 rc=0
 skipped=()
 
+# The Prometheus rules and the Alertmanager configuration carry ${DOMAIN} in
+# their annotations and URLs, so they must be RENDERED before promtool and
+# amtool see them — exactly as a deployment would.
+if [[ -f "${DW_ENV_FILE}" ]]; then
+  source "$(dirname -- "${BASH_SOURCE[0]}")/lib/render.sh"
+  load_env
+  render_configs >/dev/null
+fi
+
 have() { [[ -e "$1" ]]; }
 glob_has() { compgen -G "$1" >/dev/null 2>&1; }
 
@@ -34,16 +43,16 @@ run() {
 
 # --- Prometheus --------------------------------------------------------------
 section "Prometheus"
-if have config/prometheus/prometheus.yml; then
+if have .rendered/prometheus.yml; then
   need_cmd promtool
-  run "promtool check config" promtool check config config/prometheus/prometheus.yml
+  run "promtool check config" promtool check config .rendered/prometheus.yml
 else
   skipped+=("config/prometheus/prometheus.yml (phase 4)")
 fi
 
-if glob_has 'config/prometheus/rules/*.yml'; then
+if glob_has '.rendered/rules-*.yml'; then
   need_cmd promtool
-  run "promtool check rules" promtool check rules config/prometheus/rules/*.yml
+  run "promtool check rules" promtool check rules .rendered/rules-*.yml
 else
   skipped+=("config/prometheus/rules/*.yml (phase 4)")
 fi
@@ -59,9 +68,9 @@ fi
 
 # --- Alertmanager ------------------------------------------------------------
 section "Alertmanager"
-if have config/alertmanager/alertmanager.yml; then
+if have .rendered/alertmanager.yml; then
   need_cmd amtool
-  run "amtool check-config" amtool check-config config/alertmanager/alertmanager.yml
+  run "amtool check-config" amtool check-config .rendered/alertmanager.yml
 else
   skipped+=("config/alertmanager/alertmanager.yml (phase 4)")
 fi
@@ -101,7 +110,7 @@ fi
 section "Grafana provisioning"
 if have config/grafana/provisioning/datasources && glob_has 'config/grafana/dashboards/*.json'; then
   if python3 "${DW_ROOT}/scripts/lib/check-grafana.py"; then
-    ok "datasource UIDs and dashboard references are consistent"
+    ok "datasource UIDs, panels and generator output are consistent"
   else
     error "Grafana provisioning is inconsistent"
     rc=1
@@ -109,6 +118,9 @@ if have config/grafana/provisioning/datasources && glob_has 'config/grafana/dash
 else
   skipped+=("config/grafana/ (phase 4)")
 fi
+
+# --- Traefik middleware references in the monitoring stack ------------------
+# Already covered by the Traefik block above, which walks every stack.
 
 # --- Blackbox ----------------------------------------------------------------
 section "Blackbox exporter"

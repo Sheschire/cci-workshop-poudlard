@@ -33,6 +33,11 @@ readonly -a DW_TEMPLATED_CONFIGS=(
   "haproxy/haproxy.cfg:haproxy.cfg"
   "elasticsearch/elasticsearch.yml:elasticsearch.yml"
   "fluent-bit/fluent-bit.conf:fluent-bit.conf"
+  # The alerting rules embed ${DOMAIN} in their `dashboard` annotations, which
+  # alert2glpi puts into the ticket as a clickable link.
+  "prometheus/rules/infrastructure.yml:rules-infrastructure.yml"
+  "prometheus/rules/datastores.yml:rules-datastores.yml"
+  "prometheus/rules/backup.yml:rules-backup.yml"
 )
 
 # -----------------------------------------------------------------------------
@@ -58,7 +63,9 @@ FLUENTBIT_CONF     .rendered/fluent-bit.conf
 FLUENTBIT_PARSERS  config/fluent-bit/parsers.conf
 FLUENTBIT_LUA      config/fluent-bit/docker-metadata.lua
 PROMETHEUS         .rendered/prometheus.yml
-PROMETHEUS_RULES   config/prometheus/rules
+RULES_INFRA        .rendered/rules-infrastructure.yml
+RULES_DATASTORES   .rendered/rules-datastores.yml
+RULES_BACKUP       .rendered/rules-backup.yml
 ALERTMANAGER       .rendered/alertmanager.yml
 BLACKBOX           .rendered/blackbox.yml
 GRAFANA_INI        .rendered/grafana.ini
@@ -90,6 +97,14 @@ render_configs() {
     python3 "${DW_LIB_DIR}/render.py" "$src" "$dst"
     (( ++count ))
   done
+
+  # Alertmanager needs one conditional step that pure substitution cannot do:
+  # it REFUSES to start on an `email_configs` entry with an empty `to`, so the
+  # optional e-mail receiver has to be removed outright when SMTP is unset.
+  if [[ -f "${DW_RENDER_DIR}/alertmanager.yml" ]]; then
+    python3 "${DW_LIB_DIR}/render-alertmanager.py" "${DW_RENDER_DIR}/alertmanager.yml"
+  fi
+
   ok "${count} configuration file(s) rendered into .rendered/"
 }
 
