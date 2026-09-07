@@ -180,18 +180,40 @@ critères dynamiques listés en bas de page.
 ## Phase 6 — HA & tests
 
 **Livrables** : `tests/smoke/`, `tests/chaos/`, `stacks/overrides/single-node.yml`,
-`stacks/demo.yml`, `images/demo-producer/`
+`scripts/lib/single-node.py`, `stacks/demo.yml`, `images/demo-producer/`,
+`docs/06-haute-disponibilite.md`
 
-| # | Critère d'acceptation | État |
-|---|---|---|
-| 6.1 | `make chaos` : chaque nœud tué à tour de rôle, smoke vert à chaque étape | ⬜ |
-| 6.2 | Tickets GLPI créés puis résolus pendant les tests chaos | ⬜ |
-| 6.3 | `demo-producer` : compteur d'erreurs à zéro pendant toute la campagne | ⬜ |
-| 6.4 | `make single` opérationnel sur un poste mono-nœud | ⬜ |
-| 6.5 | `tests/smoke/network-isolation.sh` vert | ⬜ |
-| 6.6 | Documentation : résultats mesurés dans `docs/06-haute-disponibilite.md` | ⬜ |
+| # | Critère d'acceptation | État | Preuve |
+|---|---|---|---|
+| 6.1 | `make chaos` : chaque nœud tué à tour de rôle, smoke vert à chaque étape | 🖥️ | 8 scénarios écrits, du plus doux au plus brutal ; **la logique de mesure a été testée pour de vrai** (plus longue série d'échecs consécutifs, 5 séries connues, y compris la série vide) ; la plateforme est ramenée à l'état nominal entre deux scénarios, et les nœuds/labels sont restaurés depuis un `trap` même sur Ctrl-C |
+| 6.2 | Tickets GLPI créés puis résolus pendant les tests chaos | 🖥️ | `kill-node.sh` attend `NodeDown` dans Alertmanager (≤ 240 s) et compte les tickets avant/après ; la chaîne elle-même est verte en tests unitaires depuis la phase 4 |
+| 6.3 | `demo-producer` : compteur d'erreurs à zéro pendant toute la campagne | 🖥️ | service écrit et testé (**10 tests unitaires verts**) ; `run-all.sh` déclare le critère **non mesuré** — et non « satisfait » — si le producteur n'est pas déployé |
+| 6.4 | `make single` opérationnel sur un poste mono-nœud | ✅ (statique) | les **6 stacks** filtrées sont valides, déployables (round-trip `docker stack config`), sans aucune contrainte de placement et sans service sans image ; **test négatif** : la validation détecte une contrainte survivante |
+| 6.5 | `tests/smoke/network-isolation.sh` vert | 🖥️ | 5 familles de contrôles, chacune avec son **contre-test** (une sonde qui ne joint rien passerait tous les tests d'isolation) |
+| 6.6 | Documentation : résultats mesurés dans `docs/06-haute-disponibilite.md` | ✅ (structure) | document complet : matrice de défaillance, méthode de mesure, les 8 scénarios, le mode mono-nœud et ses limites, ce qui n'est pas couvert. Le tableau de résultats est prêt et marqué 🖥️ — il est **produit au bon format** par `make chaos`, à recopier |
+| 6.7 | `tests/smoke/smoke.sh` couvre le CDC §8.2 | ✅ (statique) | entrée (VIP, CA, redirection 308), services publics, **les interfaces d'administration doivent être PROTÉGÉES** (un 200 sans identifiants est un échec, pas un succès), état des 3 clusters, cibles Prometheus, alertes critical, fraîcheur des sauvegardes |
+| 6.8 | `demo-producer` documenté | ✅ | `docs/04-composants/demo-producer.md` |
 
-**Statut de la phase** : ⬜ à faire
+**Défauts trouvés et corrigés pendant cette phase** (tous constatés sur la sortie
+réelle, aucun supposé) :
+
+- `docker stack config` **ajoute** les contraintes de placement d'un override au
+  lieu de les remplacer, et **ajoute ses services à toutes les stacks**
+  fusionnées (`minio`, sans image, injecté dans `data`). Le mode mono-nœud était
+  donc inopérant tel qu'écrit → `scripts/lib/single-node.py` + `deploy.sh
+  --single` qui déploie le fichier filtré.
+- Ce fichier filtré n'était pas déployable : `docker stack deploy` interpole une
+  seconde fois et rejetait `$(cat /run/secrets/…)` dans un healthcheck ainsi que
+  `($|/)` dans une commande node-exporter → ré-échappement de tous les `$`.
+- `smoke_check` retournait un code non nul sous `set -e` : le test de fumée se
+  serait arrêté au **premier** échec au lieu de tous les rapporter.
+- Trois `` `backticks` `` Markdown dans des chaînes entre guillemets doubles
+  étaient des substitutions de commande (`run-all.sh`, `kill-node.sh`).
+- `make test-python` et la CI ne couvraient qu'`alert2glpi` ; `build-scan`
+  utilisait le mauvais contexte pour `backup-runner`.
+
+**Statut de la phase** : ✅ **terminée** — livrables complets, critères statiques
+vérifiés, critères dynamiques listés en bas de page.
 
 ---
 
@@ -514,3 +536,69 @@ vagrant ssh node1 -c "docker network inspect backup_cronjob \
 >    corriger le `PYTHONPATH` de l'image plutôt que le script.
 > 3. **`read_only: true` sur les jobs et sur `backup-metrics`** — si un service refuse de démarrer
 >    sur une erreur d'écriture, ajouter le `tmpfs` manquant, jamais retirer `read_only`.
+
+### Phase 6
+
+Les scénarios de perte de nœud s'exécutent depuis le **poste d'administration**
+(Vagrant y est requis) ; tout le reste depuis un manager.
+
+```bash
+make build            # ajoute l'image dockerwarts/demo-producer
+make deploy-demo      # la charge de fond DOIT tourner AVANT la campagne
+
+# 6.7 — test de fumée complet
+make smoke
+#   → reports/smoke-<date>.md
+#   Attention : sur une plateforme fraîchement déployée, ajouter --no-backup
+#   tant que `make backup-now` n'a pas tourné une première fois.
+tests/smoke/smoke.sh --quick        # contrôles HTTP seuls, boucle rapide
+
+# 6.5 — isolation réseau (depuis un manager)
+tests/smoke/network-isolation.sh
+#   → reports/network-isolation-<date>.md
+#   Les contre-tests comptent autant que les tests : la sonde DOIT joindre
+#   traefik:80 depuis edge, et 443 DOIT être ouvert sur la VIP. Sans eux, une
+#   sonde cassée passerait tous les contrôles d'isolation.
+
+# 6.1 / 6.2 / 6.3 — la campagne complète (~30 min)
+make chaos
+#   → reports/chaos-<date>.md, à recopier dans docs/06-haute-disponibilite.md §5
+#   Depuis un nœud (sans Vagrant), les scénarios 1 à 5 restent jouables :
+tests/chaos/run-all.sh --no-node-kill
+#   Un scénario isolé :
+tests/chaos/kill-service.sh apps_glpi-web
+tests/chaos/drain-node.sh node2 --hold 90
+tests/chaos/kill-node.sh node2 --hold 120
+
+# 6.2 — vérifier que le ticket NodeDown a bien été créé PUIS résolu
+#   pendant `kill-node.sh`, le script attend l'alerte ; après `vagrant up`,
+#   contrôler dans GLPI que le même ticket passe au statut « Résolu ».
+vagrant ssh node1 -c "docker service logs --tail 30 monitoring_alert2glpi"
+
+# 6.3 — le critère du CDC §8.2 n°5
+curl -s --cacert certs/ca.crt -u admin:$(cat secrets/dw_traefik_admin_password.txt) \
+  'https://prometheus.dockerwarts.lan/api/v1/query?query=sum(demo_producer_errors_total)' | jq
+#   attendu : 0 sur toute la durée de la campagne
+
+# 6.4 — mode mono-nœud, sur un poste avec Docker et un Swarm local
+docker swarm init 2>/dev/null || true
+make secrets certs build
+make single
+#   Les fichiers réellement déployés sont conservés : .rendered/single-<stack>.yml
+#   `make smoke` signalera des échecs (3 nœuds, Galera 3, ES green) : c'est
+#   normal et documenté (docs/06-haute-disponibilite.md §6).
+```
+
+> **À confirmer au premier démarrage.**
+>
+> 1. **`demo-producer` et les extensions C du driver Cassandra** — l'image
+>    compile `libev` et `murmur3` au *build stage*. Si le driver démarre en
+>    signalant qu'il retombe sur l'implémentation Python pure, la performance
+>    reste correcte à 20 événements/s, mais il faut corriger l'image (le
+>    `murmur3` pur Python est sur le chemin de **chaque** écriture token-aware).
+> 2. **`quick_smoke` dans `kill-node.sh`** utilise `smoke.sh --quick`, qui n'a
+>    besoin d'aucun accès Docker : c'est ce qui rend le scénario exécutable
+>    depuis le poste d'administration. À confirmer que le poste résout bien la
+>    VIP (`make hosts`).
+> 3. **La sonde à 5 Hz** utilise `sleep 0.2`, qui suppose un `sleep` GNU. Sur
+>    macOS, installer `coreutils` ou exécuter la campagne depuis un nœud.

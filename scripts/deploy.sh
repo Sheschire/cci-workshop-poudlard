@@ -58,9 +58,31 @@ deploy_stack() {
   section "Deploying the '${name}' stack"
 
   local -a args=(--detach=true --with-registry-auth --prune --compose-file "$file")
+
   if (( SINGLE )) && [[ -f "$OVERRIDE" ]]; then
-    args+=(--compose-file "$OVERRIDE")
-    warn "single-node mode: replicas reduced, placement constraints dropped — NOT highly available"
+    # Single-node mode cannot be expressed by an override file alone, and this
+    # was established on the merged output rather than assumed:
+    #
+    #   * `docker stack config` APPENDS an override's placement constraints to
+    #     the base ones instead of replacing them. `constraints: []` changes
+    #     nothing; a satisfiable constraint just gets added next to
+    #     `node.labels.cassandra == 1`. Either way the task stays Pending on a
+    #     workstation that carries no such label.
+    #   * an override file ADDS its services to whatever stack it is merged
+    #     with, so a single file covering the five stacks would inject
+    #     image-less services (`minio` into `data`, …) that Swarm rejects.
+    #
+    # So the merge is materialised, filtered by scripts/lib/single-node.py, and
+    # the filtered file is what gets deployed. `.rendered/` keeps it on disk:
+    # when something behaves oddly in single-node mode, the exact YAML that was
+    # deployed is there to read.
+    local merged="${DW_RENDER_DIR}/single-${name}.yml"
+    mkdir -p "$DW_RENDER_DIR"
+    docker stack config --compose-file "$file" --compose-file "$OVERRIDE" \
+      | python3 "${DW_LIB_DIR}/single-node.py" > "$merged"
+    args=(--detach=true --with-registry-auth --prune --compose-file "$merged")
+    warn "single-node mode: 1 replica per service, placement dropped — NOT highly available"
+    log "  stack déployée : ${merged}"
   fi
 
   # `--prune` removes the services that disappeared from the file; `--resolve-image=changed`

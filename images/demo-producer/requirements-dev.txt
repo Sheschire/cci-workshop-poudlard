@@ -1,0 +1,3 @@
+# demo-producer — test dependencies.
+-r requirements.txt
+pytest==8.4.2

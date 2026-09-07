@@ -152,6 +152,7 @@ dr-drill: ## Automated disaster-recovery drill (restores, no production impact)
 
 test-python: ## Unit tests of the home-made Python services
 	cd $(ROOT)/images/alert2glpi && python3 -m pytest -q
+	cd $(ROOT)/images/demo-producer && python3 -m pytest -q
 
 # =============================================================================
 # Backup and restore

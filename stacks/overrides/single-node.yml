@@ -1,0 +1,172 @@
+---
+# =============================================================================
+# Single-node override (CDC §3.2) — `make single`.
+#
+#   docker stack deploy -c stacks/<stack>.yml -c stacks/overrides/single-node.yml
+#
+# Applied on top of EVERY stack by scripts/deploy.sh --single. One file for all
+# of them: Compose merges by service name and simply ignores an override for a
+# service the base file does not define, so the five stacks share one set of
+# rules instead of five that drift apart.
+#
+# WHAT THIS MODE IS
+# -----------------
+# A way to run the whole platform on one workstation and iterate in minutes
+# instead of provisioning three VMs. It is what you use to check that a change
+# to a GLPI template, a dashboard or an alert rule actually works.
+#
+# WHAT IT IS NOT
+# --------------
+# **It is not highly available, and it is not a smaller production.** Everything
+# the CDC promises about availability is a property of having three nodes:
+#
+#   * Galera runs as a SINGLE node — there is no quorum, no synchronous
+#     replication, and `innodb_flush_log_at_trx_commit=0` (which is safe only
+#     BECAUSE the write is already on two other machines) becomes a real risk
+#     of losing the last second of transactions on a crash. That inversion is
+#     handled in config/galera/entrypoint.sh, not here;
+#   * Cassandra runs with RF=1: losing the volume loses the data;
+#   * Elasticsearch is a single node and stays YELLOW forever, because a
+#     replica shard cannot be allocated on the node that holds the primary.
+#     Yellow is the correct state here, not a problem to fix;
+#   * Keepalived, the VIP and the failover do not exist: Traefik binds the
+#     workstation's own ports.
+#
+# The smoke test knows none of this. Running `make smoke` against a single-node
+# deployment WILL report failures (3 Swarm nodes, Galera size 3, ES green) and
+# it is right to: those checks describe the production topology.
+#
+# What this file does, and what it CANNOT do
+# ------------------------------------------
+# It sets replica counts: every replicated service to 1, and members 2 and 3 of
+# each stateful cluster to 0.
+#
+# It does NOT drop the placement constraints, and no override file could:
+# `docker stack config` **appends** the constraints of an override to those of
+# the base file rather than replacing them. An override with `constraints: []`
+# changes nothing at all, and one with a satisfiable constraint yields
+# `['node.labels.cassandra == 1', 'node.role == manager']` — the pin is still
+# there and the task stays Pending forever. (Verified on the merged output, not
+# assumed.) Removing constraints is therefore done by
+# `scripts/lib/single-node.py`, which `deploy.sh --single` pipes the merged
+# stack through; that same filter also drops the services this file contributes
+# to a stack they do not belong to.
+# =============================================================================
+version: "3.8"
+
+# --- Anchors ------------------------------------------------------------------
+# Replica counts only — see the header for why placement is not expressible
+# here.
+x-single: &single
+  mode: replicated
+  replicas: 1
+
+# A member of a stateful cluster that must NOT run here. Set to 0 rather than
+# removed: the service still exists, so `docker stack deploy` on the three-node
+# cluster later brings it back without any special step.
+x-disabled: &disabled
+  mode: replicated
+  replicas: 0
+
+services:
+
+  # === edge ===================================================================
+  # Traefik is `mode: global` in the base stack, which on one node already means
+  # exactly one task. Left alone: overriding it to `replicated` would change how
+  # it binds its ports, and the whole point of ADR-0003 is the host-mode bind.
+  # docker-socket-proxy, crowdsec-agent, node-exporter, cadvisor and fluent-bit
+  # are global too, for the same reason — nothing to override.
+  crowdsec-lapi:
+    deploy: *single
+  whoami:
+    deploy: *single
+
+  # === registry ===============================================================
+  registry:
+    deploy: *single
+
+  # === data ===================================================================
+  # One member per cluster. galera-1 is the one kept because it is the writer
+  # HAProxy targets and the one galera-bootstrap.sh bootstraps; cassandra-1 and
+  # es-1 because they are the seeds the others are configured to find.
+  galera-1:
+    deploy: *single
+  galera-2:
+    deploy: *disabled
+  galera-3:
+    deploy: *disabled
+
+  cassandra-1:
+    deploy: *single
+  cassandra-2:
+    deploy: *disabled
+  cassandra-3:
+    deploy: *disabled
+
+  es-1:
+    deploy: *single
+  es-2:
+    deploy: *disabled
+  es-3:
+    deploy: *disabled
+
+  db-proxy:
+    deploy: *single
+  kibana:
+    deploy: *single
+
+  # === apps ===================================================================
+  # `max_replicas_per_node: 1` in the base stack would leave the second GLPI
+  # replica Pending here; one replica removes the question. (The key itself is
+  # stripped by scripts/lib/single-node.py, for the same reason as the
+  # constraints.)
+  glpi-web:
+    deploy: *single
+  glpi-cron:
+    deploy: *single
+
+  # === monitoring =============================================================
+  # ONE Prometheus, not two. HA by duplication needs two nodes to mean anything,
+  # and two instances on one machine would double the memory for no redundancy.
+  prometheus:
+    deploy: *single
+  # ONE Alertmanager: a 3-member gossip cluster on one node is three processes
+  # agreeing with themselves. The `--cluster.peer` flags in the base stack point
+  # at `tasks.alertmanager`, which resolves to the single task — it forms a
+  # one-member cluster and deduplicates normally.
+  alertmanager:
+    deploy: *single
+  grafana:
+    deploy: *single
+  alert2glpi:
+    deploy: *single
+  blackbox-exporter:
+    deploy: *single
+  mysqld-exporter:
+    deploy: *single
+  elasticsearch-exporter:
+    deploy: *single
+
+  # === backup =================================================================
+  minio:
+    deploy: *single
+  backup-metrics:
+    deploy: *single
+  swarm-cronjob:
+    deploy: *single
+  docker-socket-proxy-rw:
+    deploy: *single
+
+  # The scheduled jobs are NOT listed here. `replicas: 0` is already their
+  # normal state — swarm-cronjob scales them to 1 at their scheduled minute,
+  # here exactly as on the cluster — and their placement constraints are
+  # removed by scripts/lib/single-node.py like every other service's. Setting
+  # them to 1 would start every backup job at deployment time.
+  #
+  # backup-cassandra-2 and -3 will find no member to snapshot in this mode and
+  # will fail if triggered; that is correct and visible, rather than silently
+  # archiving nothing.
+
+  # === demo ===================================================================
+  demo-producer:
+    deploy: *single

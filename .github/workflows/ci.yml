@@ -104,8 +104,16 @@ jobs:
 
   # ---------------------------------------------------------------------------
   test-python:
-    name: Unit tests (alert2glpi)
+    name: Unit tests (${{ matrix.service }})
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      # One job per service rather than one pytest run over both: their
+      # dependency sets are unrelated (FastAPI/httpx against
+      # cassandra-driver/elasticsearch), and a resolver conflict in one must
+      # not hide the test results of the other.
+      matrix:
+        service: [alert2glpi, demo-producer]
     steps:
       - uses: actions/checkout@v4
 
@@ -113,28 +121,29 @@ jobs:
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      # alert2glpi is a phase 4 deliverable; until it exists the job reports
-      # "skipped" rather than failing the whole pipeline.
-      - name: Is alert2glpi present?
+      # Each service lands in its own phase (alert2glpi: 4, demo-producer: 6);
+      # until it exists the job reports "skipped" rather than failing the whole
+      # pipeline.
+      - name: Is images/${{ matrix.service }} present?
         id: probe
         run: |
-          if [ -f images/alert2glpi/requirements.txt ]; then
+          if [ -f "images/${{ matrix.service }}/requirements.txt" ]; then
             echo "present=true" >> "$GITHUB_OUTPUT"
           else
             echo "present=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::images/alert2glpi is not implemented yet (phase 4)"
+            echo "::notice::images/${{ matrix.service }} is not implemented yet"
           fi
 
       - name: Install the dependencies
         if: steps.probe.outputs.present == 'true'
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r images/alert2glpi/requirements.txt
-          python -m pip install -r images/alert2glpi/requirements-dev.txt
+          python -m pip install -r "images/${{ matrix.service }}/requirements.txt"
+          python -m pip install -r "images/${{ matrix.service }}/requirements-dev.txt"
 
       - name: pytest
         if: steps.probe.outputs.present == 'true'
-        run: python -m pytest images/alert2glpi/tests -q
+        run: python -m pytest "images/${{ matrix.service }}/tests" -q
 
   # ---------------------------------------------------------------------------
   build-scan:
@@ -162,11 +171,26 @@ jobs:
             echo "::notice::images/${{ matrix.image }} is not implemented yet"
           fi
 
+      # backup-runner builds from the REPOSITORY ROOT: it copies
+      # scripts/backup/*.sh, which the CDC §10.1 layout puts outside images/.
+      # The root .dockerignore is deny-by-default, so the context stays limited
+      # to those scripts — see scripts/build-images.sh.
+      - name: Build context for ${{ matrix.image }}
+        if: steps.probe.outputs.present == 'true'
+        id: ctx
+        run: |
+          if [ "${{ matrix.image }}" = "backup-runner" ]; then
+            echo "context=." >> "$GITHUB_OUTPUT"
+          else
+            echo "context=images/${{ matrix.image }}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build ${{ matrix.image }}
         if: steps.probe.outputs.present == 'true'
         uses: docker/build-push-action@v6
         with:
-          context: images/${{ matrix.image }}
+          context: ${{ steps.ctx.outputs.context }}
+          file: images/${{ matrix.image }}/Dockerfile
           push: false
           load: true
           tags: dockerwarts/${{ matrix.image }}:ci

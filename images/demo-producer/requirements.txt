@@ -1,0 +1,8 @@
+# demo-producer — runtime dependencies, pinned (CDC §10.2).
+#
+# elasticsearch is held on the 8.x line, NOT the latest 9.x: the client refuses
+# to talk to a cluster of a different major version, and the platform runs
+# Elasticsearch 8.19. Bumping this line means bumping the cluster first.
+cassandra-driver==3.30.1
+elasticsearch==8.19.3
+prometheus_client==0.26.0

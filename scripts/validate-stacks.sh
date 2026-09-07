@@ -155,19 +155,56 @@ PY
 done
 
 section "Overrides"
-# The single-node override is applied on top of every stack; validate the
-# combination the way `make single` deploys it.
+# Single-node mode (CDC §3.2). What is validated here is the file `make single`
+# actually deploys — the merge PIPED THROUGH scripts/lib/single-node.py — and
+# not merely the merge. Validating the merge alone would pass while the real
+# deployment failed on the two problems that filter exists for: services
+# without an image, contributed by the override to a stack they do not belong
+# to, and placement constraints that Compose appends rather than replaces.
+#
+# Three things are checked, in order of how badly each would bite:
+#   1. the filtered file is valid input to `docker stack deploy`;
+#   2. no service is left pinned to a node label — on one node it would sit
+#      Pending forever, with no error anywhere;
+#   3. no service is left without an image.
 if [[ -f stacks/overrides/single-node.yml ]]; then
   for stack in "${STACK_FILES[@]}"; do
     name="$(basename "$stack" .yml)"
     [[ "$name" == "registry" ]] && continue
-    if docker stack config -c "$stack" -c stacks/overrides/single-node.yml >/dev/null 2>&1; then
-      ok "${name} + single-node override"
-    else
-      error "${name} + single-node override is invalid"
-      docker stack config -c "$stack" -c stacks/overrides/single-node.yml 2>&1 | sed 's/^/    /' >&2
+    filtered="${rendered_dir}/single-${name}.yml"
+    if ! docker stack config -c "$stack" -c stacks/overrides/single-node.yml 2>/dev/null \
+         | python3 "${DW_LIB_DIR}/single-node.py" > "$filtered" 2>/dev/null; then
+      error "${name}: le filtre single-node a échoué"
       rc=1
+      continue
     fi
+    if ! docker stack config -c "$filtered" >/dev/null 2>&1; then
+      error "${name} + single-node : le fichier filtré n'est pas déployable"
+      docker stack config -c "$filtered" 2>&1 | sed 's/^/    /' >&2
+      rc=1
+      continue
+    fi
+    if ! python3 - "$filtered" "$name" <<'PY'; then
+import sys, yaml
+path, stack = sys.argv[1], sys.argv[2]
+doc = yaml.safe_load(open(path)) or {}
+bad = []
+for svc, spec in (doc.get("services") or {}).items():
+    if not (spec or {}).get("image"):
+        bad.append(f"{svc}: no image (contributed by the override)")
+    placement = ((spec.get("deploy") or {}).get("placement") or {})
+    if placement.get("constraints"):
+        bad.append(f"{svc}: still pinned by {placement['constraints']}")
+    if placement.get("max_replicas_per_node"):
+        bad.append(f"{svc}: max_replicas_per_node survived")
+for line in bad:
+    print(f"    {stack} (single-node): {line}", file=sys.stderr)
+sys.exit(1 if bad else 0)
+PY
+      rc=1
+      continue
+    fi
+    ok "${name} + single-node (filtré, déployable, sans contrainte de placement)"
   done
 fi
 
