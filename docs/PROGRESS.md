@@ -29,7 +29,7 @@ de développement peut exécuter et ce qu'elle ne peut pas.
 | Résolution de digests (manifestes) | ✅ | `registry-1.docker.io`, `gcr.io` joignables |
 | `docker.elastic.co` | ❌ | refusé par la politique d'egress → digests ES/Kibana non résolus |
 | Vagrant / VirtualBox | ❌ | absent, pas de virtualisation imbriquée |
-| Ansible + ansible-lint | ✅ | ansible-core 2.19.12, ansible-lint 26.8.0 |
+| Ansible + ansible-lint | ⚠️ | ansible-core 2.19.12, ansible-lint 26.8.0 — mais `galaxy.ansible.com` est refusé par la politique d'egress (`403`). Sans les collections, `make lint-ansible` échoue sur 4 `syntax-check[unknown-module]` (`community.docker.docker_swarm`, `docker_node`, `community.general.timezone`) : ce sont des modules réels, déclarés dans `ansible/requirements.yml`. **Ce n'est pas une régression** — le lint était vert en phase 0, quand les collections avaient pu être installées. Sur une machine ayant accès à Galaxy :<br/>`ansible-galaxy collection install -r ansible/requirements.yml && make lint-ansible` |
 | yamllint, shellcheck, hadolint, promtool, amtool, ruff, pytest | ✅ | installés |
 
 **Conséquence** : tous les critères « statiques » (lint, validation de configuration, tests
