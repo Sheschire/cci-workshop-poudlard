@@ -1,0 +1,21 @@
+# Local environment & secrets — never commit
+.env
+secrets/
+certs/
+*.pem
+*.key
+*.crt
+!config/**/*.example
+
+# Vagrant / Ansible
+.vagrant/
+*.retry
+ansible/inventory/hosts.yml
+
+# Tooling
+.venv/
+__pycache__/
+*.pyc
+node_modules/
+.DS_Store
+*.log
