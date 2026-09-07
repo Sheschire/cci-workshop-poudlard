@@ -66,6 +66,18 @@ else
   skipped+=("config/alertmanager/alertmanager.yml (phase 4)")
 fi
 
+# --- Traefik: cross-check the config against the stack labels ---------------
+# Traefik drops a router with a dangling middleware reference *silently*: the
+# URL 404s, or an administration UI quietly loses its allowlist. Neither
+# yamllint nor `docker stack config` can see that.
+section "Traefik"
+if have config/traefik/dynamic.yml; then
+  run "references resolve, administration routes carry admin-allowlist" \
+    python3 "${DW_ROOT}/scripts/lib/check-traefik.py"
+else
+  skipped+=("config/traefik/ (phase 1)")
+fi
+
 # --- Generic YAML / JSON well-formedness ------------------------------------
 # yamllint already covers style; this catches files it excludes (the Grafana
 # dashboards) and proves that every JSON payload parses.

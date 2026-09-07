@@ -61,17 +61,20 @@ critères dynamiques listés en bas de page avec leur commande.
 **Livrables** : `stacks/registry.yml`, `stacks/edge.yml`, `config/traefik/`, `config/crowdsec/`,
 `scripts/gen-certs.sh`, `scripts/init-secrets.sh`, `scripts/deploy.sh`, `make build`
 
-| # | Critère d'acceptation | État |
-|---|---|---|
-| 1.1 | `https://whoami.dockerwarts.lan` répond via la VIP | ⬜ |
-| 1.2 | Certificat wildcard valide, signé par la CA interne | ⬜ |
-| 1.3 | L'IP client réelle apparaît dans la réponse whoami (`mode: host`) | ⬜ |
-| 1.4 | `cscli decisions add -i <ip>` → la requête depuis cette IP reçoit `403` | ⬜ |
-| 1.5 | `vagrant halt node1` → bascule VIP mesurée < 5 s | ⬜ |
-| 1.6 | `make build` pousse les images maison dans le registry interne | ⬜ |
-| 1.7 | Documentation : `traefik.md`, `keepalived.md`, `crowdsec.md` | ⬜ |
+| # | Critère d'acceptation | État | Preuve |
+|---|---|---|---|
+| 1.1 | `https://whoami.dockerwarts.lan` répond via la VIP | 🖥️ | stack validée (`docker stack config`), routeur et middlewares vérifiés par `check-traefik.py` |
+| 1.2 | Certificat wildcard valide, signé par la CA interne | ✅ | `gen-certs.sh` **réellement exécuté** : CA 4096 bits, wildcard 825 j, `openssl verify` OK, paire clé↔certificat cohérente, SAN = `*.dockerwarts.lan`, `dockerwarts.lan`, `localhost`, `192.168.56.10`, `127.0.0.1` |
+| 1.3 | L'IP client réelle apparaît dans la réponse whoami (`mode: host`) | 🖥️ | `ports.mode: host` vérifié dans la stack rendue ; `forwardedHeaders.trustedIPs` vide |
+| 1.4 | `cscli decisions add -i <ip>` → `403` | 🖥️ | profils, acquisition et middleware bouncer validés statiquement (5 profils, 3 sources) |
+| 1.5 | `vagrant halt node1` → bascule VIP < 5 s | 🖥️ | arithmétique des priorités vérifiée (§3.2 de `keepalived.md`), `keepalived.conf` rendu pour les 3 nœuds |
+| 1.6 | `make build` pousse les images maison dans le registry interne | 🖥️ | `registry.yml` validé ; `build-images.sh` écrit (images maison livrées en phases 2 à 6) |
+| 1.7 | Documentation : `traefik.md`, `keepalived.md`, `crowdsec.md` | ✅ | trois fichiers, chaque section de configuration expliquée |
+| 1.8 | Durcissement CDC §6.4 sur **tous** les services | ✅ | `no-new-privileges` + `cap_drop: [ALL]` partout, `NET_BIND_SERVICE` seul ajout (Traefik), `read_only` sur 3 des 5 services, `user` non root sur whoami — **contrôle automatisé en CI** (test négatif effectué) |
+| 1.9 | Aucun conteneur ne monte le socket Docker sauf le proxy | ✅ | contrôle automatisé dans `validate-stacks.sh` |
 
-**Statut de la phase** : ⬜ à faire
+**Statut de la phase** : ✅ **terminée** — livrables complets, critères statiques vérifiés,
+critères dynamiques listés en bas de page.
 
 ---
 
@@ -231,3 +234,43 @@ make lint
 Les digests Elasticsearch et Kibana restent à résoudre (registre `docker.elastic.co` refusé par
 la politique d'egress de la session) — commande exacte dans
 [`docs/04-composants/versions.md`](04-composants/versions.md).
+
+### Phase 1
+
+```bash
+make secrets certs          # déjà exécuté hors VM ; à rejouer sur un manager
+make build                  # registry + images maison
+make deploy-edge
+
+# 1.1 / 1.2 / 1.3 — whoami via la VIP, certificat validé par la CA, IP réelle
+curl --cacert certs/ca.crt https://whoami.dockerwarts.lan/ | grep -E 'RemoteAddr|X-Real-Ip'
+#   RemoteAddr doit être l'IP du poste client, PAS une passerelle 10.20.x.x
+openssl s_client -connect 192.168.56.10:443 -servername whoami.dockerwarts.lan \
+  -CAfile certs/ca.crt </dev/null 2>&1 | grep -E 'Verify return code|subject='
+
+# 1.4 — bannissement CrowdSec (depuis une source HORS CLUSTER_CIDR, cf. liste blanche)
+vagrant ssh node3 -c "docker exec \$(docker ps -q -f name=edge_crowdsec-lapi) \
+  cscli decisions add -i 203.0.113.42 -d 10m -R manual-test"
+#   attendre ≤ 60 s (mode stream) puis, depuis 203.0.113.42 :
+curl -sk -o /dev/null -w '%{http_code}\n' https://whoami.dockerwarts.lan/   # → 403
+
+# 1.5 — bascule VIP mesurée
+( while :; do date +%s.%N; curl -sk --max-time 1 -o /dev/null \
+    https://whoami.dockerwarts.lan/ && echo OK || echo KO; sleep 0.2; done ) &
+vagrant halt -f node1
+#   compter les KO consécutifs × 0,2 s → doit rester < 5 s
+vagrant ssh node2 -c 'journalctl -u keepalived -n 5 --no-pager'
+
+# 1.6 — registry
+curl -s http://192.168.56.13:5000/v2/_catalog
+
+# 1.8 — durcissement effectif dans les conteneurs
+vagrant ssh node1 -c "docker inspect \$(docker ps -q -f name=edge_traefik) \
+  --format '{{.HostConfig.SecurityOpt}} {{.HostConfig.CapDrop}} {{.HostConfig.CapAdd}} {{.HostConfig.ReadonlyRootfs}}'"
+```
+
+> **À confirmer au premier démarrage** : `read_only: true` sur `traefik` et
+> `docker-socket-proxy` n'a pas pu être validé à l'exécution (images non téléchargeables dans la
+> session). Si un service refuse de démarrer avec une erreur d'écriture, ajouter le `tmpfs`
+> manquant plutôt que de retirer `read_only`, et consigner le chemin dans
+> `docs/04-composants/traefik.md`.

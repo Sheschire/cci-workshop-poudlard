@@ -26,3 +26,6 @@ ansible/inventory/hosts.yml
 
 # Test and drill reports (only the ones copied into docs/ are committed)
 reports/
+
+# Rendered configuration (produced by scripts/lib/render.sh at deploy time)
+.rendered/

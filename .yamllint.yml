@@ -8,8 +8,14 @@ ignore: |
   .git/
   .vagrant/
   node_modules/
+  # Grafana dashboards are machine-generated JSON-in-YAML-extension files.
   config/grafana/dashboards/
+  # Build artefacts: .rendered/ is produced by scripts/lib/render.sh, and the
+  # sources it renders are linted.
+  .rendered/
   reports/
+  secrets/
+  certs/
 
 rules:
   line-length:

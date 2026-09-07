@@ -1,0 +1,110 @@
+---
+# =============================================================================
+# Dockerwarts N°1 — internal image registry.
+#
+#   scripts/deploy.sh registry        (make deploy-registry, or implied by
+#                                      `make build`)
+#
+# Why a registry at all (CDC §10.2)
+# ---------------------------------
+# The four home-made images must run as the SAME bits on the three nodes.
+# Building locally on each node cannot guarantee that: two builds of the same
+# Dockerfile a minute apart can pull different base layers. One registry, one
+# push, three identical pulls — and `docker service ps` shows the same digest
+# everywhere.
+#
+# Plain HTTP is acceptable here and only here: the registry listens on node3,
+# port 5000 is published in `mode: host`, and the host firewall only accepts it
+# from CLUSTER_CIDR. It is declared in `insecure-registries` by the Ansible
+# `docker` role. The TLS variant is documented in docs/08-exploitation.md.
+# =============================================================================
+version: "3.8"
+
+services:
+  registry:
+    image: registry:2.8.3@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+    # CDC §6.4 hardening. The registry listens on 5000 and 5001 (> 1024) and
+    # writes only to its data volume: no capability, no writable root
+    # filesystem.
+    #
+    # No `user:` override: /var/lib/registry is owned by root inside the image,
+    # and Docker seeds a new named volume with the image's ownership. Forcing a
+    # non-root uid would make the very first push fail with EACCES. Dropping
+    # every capability is the meaningful hardening here.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=64M
+    environment:
+      REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY: /var/lib/registry
+      # Deleting a manifest is what makes `make build --force` able to replace
+      # a tag; without it a tag is write-once and the operator is stuck.
+      REGISTRY_STORAGE_DELETE_ENABLED: "true"
+      # Prometheus metrics on a debug port, scraped over the `mgmt` overlay.
+      REGISTRY_HTTP_DEBUG_ADDR: ":5001"
+      REGISTRY_HTTP_DEBUG_PROMETHEUS_ENABLED: "true"
+      REGISTRY_LOG_LEVEL: info
+      REGISTRY_LOG_FORMATTER: json
+    volumes:
+      - registry_data:/var/lib/registry
+    ports:
+      # `mode: host` and not `ingress`: the registry must answer on node3's own
+      # address (${REGISTRY} = <node3>:5000), not on any node through the
+      # routing mesh — the firewall rule is written for that one node.
+      - target: 5000
+        published: 5000
+        protocol: tcp
+        mode: host
+    networks:
+      - mgmt
+    healthcheck:
+      # The registry image has no shell utilities beyond wget from busybox.
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:5000/v2/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.labels.registry == true
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 512M
+        reservations:
+          cpus: "0.05"
+          memory: 64M
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 0
+      update_config:
+        parallelism: 1
+        order: stop-first     # a single host-mode port: never two at once
+        failure_action: rollback
+      labels:
+        # Scraped by Prometheus through the generic Swarm service discovery
+        # convention (CDC §7.6).
+        prometheus.job: "registry"
+        prometheus.port: "5001"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  # Local volume on node3, deliberately NOT on NFS: the registry is rebuildable
+  # from `make build` and is therefore not part of the backup scope (CDC §9.1).
+  registry_data:
+    driver: local
+
+networks:
+  mgmt:
+    external: true

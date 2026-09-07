@@ -16,11 +16,19 @@
 # =============================================================================
 set -Eeuo pipefail
 source "$(dirname -- "${BASH_SOURCE[0]}")/lib/common.sh"
+source "$(dirname -- "${BASH_SOURCE[0]}")/lib/render.sh"
 
 need_cmd docker
 load_env
 
 cd "$DW_ROOT"
+
+# Render exactly like a deployment would: the stacks reference .rendered/ files
+# and ${CONFIG_HASH_*}, so validating without rendering would validate a
+# different file than the one that gets deployed.
+section "Rendering"
+render_configs
+export_config_hashes
 
 # The Swarm-specific config keys (`configs`, `secrets`, `deploy`) require the
 # stack context; `docker stack config` provides it.
@@ -90,7 +98,7 @@ PY
     )
   fi
 
-  # 3. Per-service hygiene required by CDC §10.2.
+  # 3. Per-service hygiene and hardening required by CDC §10.2 and §6.4.
   python3 - "${rendered_dir}/${name}.yml" "$name" <<'PY' || rc=1
 import sys, yaml
 path, stack = sys.argv[1], sys.argv[2]
@@ -98,13 +106,27 @@ doc = yaml.safe_load(open(path)) or {}
 bad = []
 for svc, spec in (doc.get("services") or {}).items():
     deploy = spec.get("deploy") or {}
-    res = (deploy.get("resources") or {}).get("limits") or {}
-    if not res:
+
+    # --- CDC §10.2: operational hygiene ---------------------------------
+    if not (deploy.get("resources") or {}).get("limits"):
         bad.append(f"{svc}: no deploy.resources.limits")
     if not deploy.get("restart_policy"):
         bad.append(f"{svc}: no deploy.restart_policy")
     if not spec.get("logging"):
         bad.append(f"{svc}: no logging driver")
+    if not spec.get("healthcheck"):
+        bad.append(f"{svc}: no healthcheck")
+
+    # --- CDC §6.4: container hardening ----------------------------------
+    # `no-new-privileges` and an empty capability set are unconditional: they
+    # cost nothing and no image in this platform needs otherwise. `read_only`
+    # and a non-root `user:` are conditional ("quand l'image le permet"), so
+    # they are not enforced here — each exception is argued in the stack.
+    sec = spec.get("security_opt") or []
+    if "no-new-privileges:true" not in sec:
+        bad.append(f"{svc}: missing security_opt no-new-privileges:true")
+    if "ALL" not in (spec.get("cap_drop") or []):
+        bad.append(f"{svc}: missing cap_drop: [ALL]")
 for line in bad:
     print(f"    {stack}: {line}", file=sys.stderr)
 sys.exit(1 if bad else 0)

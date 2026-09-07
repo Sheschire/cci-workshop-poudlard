@@ -1,0 +1,165 @@
+---
+# =============================================================================
+# Traefik v3 — static configuration.
+#
+# "Static" means: read once at start-up. Changing this file requires restarting
+# the service (`docker service update --force edge_traefik`). Everything that
+# can change at runtime (routers, middlewares, TLS material) lives in
+# dynamic.yml or in the Swarm service labels.
+#
+# Deployed as a Swarm `config`, mounted read-only at /etc/traefik/traefik.yml.
+# Documented section by section in docs/04-composants/traefik.md.
+# =============================================================================
+
+global:
+  # No "new version available" call-out: the platform runs offline and the
+  # version is pinned by digest (CDC §6.4).
+  checkNewVersion: false
+  sendAnonymousUsage: false
+
+# -----------------------------------------------------------------------------
+# Entry points
+#
+# Both are published in `mode: host` (ADR-0003), so Traefik sees the real client
+# address. This is what makes CrowdSec's IP-based banning work at all, and what
+# makes the access log usable for forensics.
+# -----------------------------------------------------------------------------
+entryPoints:
+  web:
+    address: ":80"
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+          permanent: true          # 308: the browser remembers, no second hop
+    # `/ping` is served here too (see the `ping` section): Keepalived's
+    # chk_traefik probes http://127.0.0.1/ping, before any TLS.
+    transport:
+      respondingTimeouts:
+        readTimeout: 60s
+        writeTimeout: 60s
+        idleTimeout: 180s
+
+  websecure:
+    address: ":443"
+    http:
+      tls:
+        options: modern           # defined in dynamic.yml
+      # Applied to EVERY route, including ones that forget their labels:
+      # a security header set must not be opt-in.
+      middlewares:
+        - security-headers@file
+        - crowdsec@file
+    transport:
+      respondingTimeouts:
+        readTimeout: 60s
+        writeTimeout: 60s
+        idleTimeout: 180s
+    # Real client IP. Traefik listens directly on the host (no Swarm routing
+    # mesh, no upstream proxy), so there is NOTHING to trust in front of it:
+    # `insecure: false` and an empty trusted list mean X-Forwarded-* headers
+    # sent by a client are discarded rather than believed.
+    forwardedHeaders:
+      trustedIPs: []
+
+  # Metrics + dashboard API, on a separate port. Never published on the host:
+  # Prometheus reaches :8082 over the `monitoring` overlay, and the dashboard
+  # is exposed through a normal HTTPS router behind allowlist + basic-auth.
+  metrics:
+    address: ":8082"
+
+# -----------------------------------------------------------------------------
+# Providers
+# -----------------------------------------------------------------------------
+providers:
+  # Swarm services. The connection goes through docker-socket-proxy
+  # (read-only, SERVICES/TASKS/NETWORKS/NODES only): no Traefik container ever
+  # mounts /var/run/docker.sock (CDC §6.4).
+  swarm:
+    endpoint: "tcp://docker-socket-proxy:2375"
+    exposedByDefault: false        # a service is routed only if it says so
+    network: edge                  # which network Traefik uses to reach a task
+    refreshSeconds: 10
+    defaultRule: "Host(`{{ normalize .Name }}.dockerwarts.lan`)"
+
+  # Static routers, middlewares and TLS material.
+  file:
+    filename: /etc/traefik/dynamic.yml
+    watch: true                    # picked up without a restart
+
+# -----------------------------------------------------------------------------
+# API and dashboard
+#
+# `insecure: false` — no unauthenticated :8080. The dashboard is reached
+# through the router defined in dynamic.yml, which stacks admin-allowlist +
+# basic-auth on top of TLS.
+# -----------------------------------------------------------------------------
+api:
+  dashboard: true
+  insecure: false
+
+# Liveness endpoint. `entryPoint: web` on purpose: Keepalived's check must not
+# depend on TLS, on a certificate expiring, or on name resolution.
+ping:
+  entryPoint: web
+  manualRouting: false
+
+# -----------------------------------------------------------------------------
+# Observability
+# -----------------------------------------------------------------------------
+metrics:
+  prometheus:
+    entryPoint: metrics
+    addEntryPointsLabels: true
+    addRoutersLabels: true
+    addServicesLabels: true
+    # Explicit buckets: the defaults are too coarse to show a p99 in the
+    # 100 ms–1 s range, which is where GLPI actually lives.
+    buckets: [0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
+
+# Operational log (not the access log).
+log:
+  level: INFO
+  format: json                     # parsed by Fluent Bit like any container log
+
+# Access log — the raw material of BOTH the CrowdSec agent and the
+# `logs-traefik` data stream. Written to a host bind mount so that:
+#   * the CrowdSec agent of the same node can tail it,
+#   * logrotate (Ansible, `copytruncate`) can rotate it without breaking either
+#     reader.
+accessLog:
+  filePath: /var/log/traefik/access.log
+  format: json
+  bufferingSize: 100               # batch the writes; 100 lines is ~a second
+  fields:
+    defaultMode: keep
+    names:
+      # Never log the Authorization header or cookies.
+      ClientUsername: drop
+    headers:
+      defaultMode: drop            # drop everything, then allow-list
+      names:
+        User-Agent: keep           # CrowdSec scenarios match on it
+        Referer: keep
+        Content-Type: keep
+        X-Request-Id: keep
+  filters:
+    # Keep every error plus a sample of the rest: enough for CrowdSec to
+    # detect behaviour without writing gigabytes of 200s.
+    statusCodes: ["400-599"]
+    retryAttempts: true
+    minDuration: "500ms"
+
+# -----------------------------------------------------------------------------
+# CrowdSec bouncer plugin (layer 3 of the firewall, ADR-0004)
+#
+# Traefik downloads the plugin at start-up from GitHub and compiles it into its
+# Yaegi interpreter. The version is pinned; the actual configuration (LAPI URL,
+# key, stream mode) is in the `crowdsec` middleware of dynamic.yml.
+# -----------------------------------------------------------------------------
+experimental:
+  plugins:
+    crowdsec:
+      moduleName: github.com/maxlerebourg/crowdsec-bouncer-traefik-plugin
+      version: v1.4.6

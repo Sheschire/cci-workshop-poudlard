@@ -1,0 +1,58 @@
+# =============================================================================
+# CrowdSec — acquisition (what the agents read).
+#
+# Deployed as a Swarm `config`, mounted read-only at
+# /etc/crowdsec/acquis.d/dockerwarts.yaml on every `crowdsec-agent` task
+# (global service: one per node).
+#
+# Each document below declares one source. `labels.type` selects the parser
+# that CrowdSec applies, and therefore which scenarios can match.
+#
+# Documented in docs/04-composants/crowdsec.md.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# 1. Traefik access log — the main source.
+#
+# Traefik writes JSON to a host bind mount; the agent of the SAME node tails
+# its own node's file. Three agents therefore cover the three entry points,
+# and all three report to the single LAPI, which is what turns three
+# independent views into one shared decision list.
+#
+# The file is rotated by logrotate with `copytruncate` (Ansible role `common`),
+# so the inode is preserved and the agent never loses its position.
+# -----------------------------------------------------------------------------
+---
+filenames:
+  - /var/log/traefik/access.log
+labels:
+  type: traefik
+poll_without_inotify: false
+
+# -----------------------------------------------------------------------------
+# 2. Host authentication log — SSH.
+#
+# fail2ban already bans locally (Ansible role `common`), but it does so per
+# host and without sharing. Feeding auth.log to CrowdSec adds the cluster-wide
+# view and the community blocklist: an IP that brute-forces node1's SSH is
+# banned at the HTTP layer of all three nodes as well.
+# -----------------------------------------------------------------------------
+---
+filenames:
+  - /var/log/auth.log
+labels:
+  type: syslog
+
+# -----------------------------------------------------------------------------
+# 3. Kernel log — the DROPs of the host firewall.
+#
+# The `dockerwarts-firewall` script logs a rate-limited sample of what it drops
+# with the prefixes `dw-input-drop:` and `dw-docker-drop:`. Feeding it to the
+# `crowdsecurity/linux` collection turns port scans into detections, and gives
+# the "Sécurité" dashboard its host-level signal.
+# -----------------------------------------------------------------------------
+---
+filenames:
+  - /var/log/kern.log
+labels:
+  type: syslog
