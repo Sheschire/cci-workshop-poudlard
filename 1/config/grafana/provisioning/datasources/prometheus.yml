@@ -1,0 +1,20 @@
+# Source de données déclarée au démarrage : personne n'a à la saisir à la main,
+# et une réinstallation repart avec exactement la même configuration.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    # uid fixe : les tableaux de bord versionnés y font référence. Sans lui,
+    # Grafana en tire un au hasard et les panneaux affichent « datasource not
+    # found » à la première réinstallation.
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    # Permet de réappliquer ce fichier sur une instance déjà provisionnée.
+    editable: false
+    jsonData:
+      # Doit correspondre au scrape_interval de Prometheus, sinon les graphes
+      # affichent des trous ou lissent des variations qui existaient vraiment.
+      timeInterval: 15s

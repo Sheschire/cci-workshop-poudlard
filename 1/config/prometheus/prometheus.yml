@@ -1,0 +1,48 @@
+# =============================================================================
+# Prometheus — collecte des métriques
+#
+# Quatre sources suffisent à couvrir toute la plateforme :
+#   node-exporter  la machine      (CPU, RAM, disque, charge)
+#   cadvisor       les conteneurs  (CPU, RAM, redémarrages, par service)
+#   traefik        le trafic       (codes HTTP, latence, requêtes/s)
+#   prometheus     lui-même        (pour savoir quand LA collecte tombe)
+#
+# Il n'y a pas d'Alertmanager : les règles de alerts.yml sont évaluées ici et
+# consultables dans l'onglet « Alerts » et dans Grafana. Choix assumé — voir
+# docs/04-haute-disponibilite.md.
+# =============================================================================
+
+global:
+  # 15 s : assez fin pour voir un incident se former, assez large pour que
+  # 30 jours de rétention tiennent sur quelques gigaoctets.
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    infra: dockerwarts
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # Métriques de l'hôte. `pid: host` dans docker-compose.yml lui donne la vraie
+  # vue de la machine et non celle de son propre espace de noms.
+  - job_name: node
+    static_configs:
+      - targets: ["node-exporter:9100"]
+
+  # Métriques par conteneur. C'est cette source qui répond à « quel service
+  # consomme la mémoire » et « lequel vient de redémarrer ».
+  - job_name: cadvisor
+    static_configs:
+      - targets: ["cadvisor:8080"]
+
+  # Trafic vu par le reverse proxy : le seul endroit où l'on voit les erreurs
+  # telles que les utilisateurs les subissent.
+  - job_name: traefik
+    static_configs:
+      - targets: ["traefik:8082"]

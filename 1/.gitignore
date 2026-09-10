@@ -13,4 +13,3 @@ backups/
 # --- Bruit des systèmes de fichiers ------------------------------------------
 .DS_Store
 *.swp
-*.pdf

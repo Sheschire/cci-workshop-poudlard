@@ -1,0 +1,118 @@
+# =============================================================================
+# Règles d'alerte
+#
+# Principe retenu : peu de règles, mais toutes actionnables. Une alerte qui se
+# déclenche sans qu'on sache quoi en faire finit ignorée, et emporte avec elle
+# la crédibilité de celles qui comptent.
+#
+# Chaque règle porte un `for:` — la condition doit tenir dans la durée. C'est
+# ce qui distingue un incident d'un pic de trois secondes.
+#
+# Consultation : Prometheus → onglet Alerts, ou le tableau de bord Grafana.
+# =============================================================================
+
+groups:
+
+  # ---------------------------------------------------------------------------
+  - name: disponibilite
+    rules:
+
+      # La règle la plus importante du fichier : une cible que Prometheus
+      # n'arrive plus à interroger est une cible dont on ne sait plus rien.
+      - alert: CibleInjoignable
+        expr: up == 0
+        for: 2m
+        labels:
+          severity: critique
+        annotations:
+          summary: "Cible {{ $labels.job }} injoignable"
+          description: >-
+            Prometheus n'obtient plus de réponse de {{ $labels.instance }}
+            (job {{ $labels.job }}) depuis 2 minutes.
+
+      # Un conteneur qui redémarre en boucle : le symptôme d'une mauvaise
+      # configuration ou d'un manque de mémoire, jamais d'un incident passager.
+      - alert: ConteneurEnBoucleDeRedemarrage
+        expr: changes(container_start_time_seconds{name!=""}[15m]) > 3
+        for: 5m
+        labels:
+          severity: critique
+        annotations:
+          summary: "Le conteneur {{ $labels.name }} redémarre en boucle"
+          description: >-
+            {{ $labels.name }} a redémarré plus de 3 fois en 15 minutes.
+            Vérifier `docker compose logs {{ $labels.name }}`.
+
+  # ---------------------------------------------------------------------------
+  - name: ressources
+    rules:
+
+      - alert: DisqueBientotPlein
+        # Sur la partition qui porte /var/lib/docker : c'est elle qui se remplit,
+        # et un disque plein arrête MariaDB, Elasticsearch et Cassandra ensemble.
+        expr: >-
+          node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"}
+          / node_filesystem_size_bytes{fstype!~"tmpfs|overlay"} < 0.15
+        for: 10m
+        labels:
+          severity: majeure
+        annotations:
+          summary: "Moins de 15 % d'espace libre sur {{ $labels.mountpoint }}"
+          description: >-
+            Il reste moins de 15 % d'espace sur {{ $labels.mountpoint }}.
+            Purger les sauvegardes anciennes ou les images inutilisées.
+
+      - alert: MemoireHoteSaturee
+        expr: >-
+          node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes < 0.10
+        for: 10m
+        labels:
+          severity: majeure
+        annotations:
+          summary: "Moins de 10 % de mémoire disponible sur l'hôte"
+          description: >-
+            Le noyau va commencer à tuer des processus (OOM). Réduire les
+            limites mémoire dans docker-compose.yml ou agrandir la machine.
+
+      # Un conteneur à 90 % de SA limite va être tué par le noyau, sans que la
+      # machine, elle, manque de mémoire. C'est une panne bien plus discrète.
+      - alert: ConteneurProcheDeSaLimiteMemoire
+        expr: >-
+          container_memory_usage_bytes{name!=""}
+          / container_spec_memory_limit_bytes{name!=""} > 0.90
+        for: 10m
+        labels:
+          severity: majeure
+        annotations:
+          summary: "{{ $labels.name }} atteint 90 % de sa limite mémoire"
+          description: >-
+            Relever `deploy.resources.limits.memory` pour ce service, ou
+            réduire son tas JVM si c'en est un.
+
+      - alert: ChargeCpuElevee
+        expr: >-
+          100 * (1 - avg without(cpu)(rate(node_cpu_seconds_total{mode="idle"}[5m]))) > 90
+        for: 15m
+        labels:
+          severity: mineure
+        annotations:
+          summary: "Processeur au-dessus de 90 % depuis 15 minutes"
+
+  # ---------------------------------------------------------------------------
+  - name: trafic
+    rules:
+
+      # Vue côté utilisateur : ce que les gens voient réellement, par opposition
+      # à « le conteneur tourne ».
+      - alert: TauxErreursHttpEleve
+        expr: >-
+          sum(rate(traefik_service_requests_total{code=~"5.."}[5m]))
+          / sum(rate(traefik_service_requests_total[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: majeure
+        annotations:
+          summary: "Plus de 5 % des réponses HTTP sont en erreur serveur"
+          description: >-
+            Le proxy renvoie des 5xx : le service derrière est en panne ou
+            saturé, même si son conteneur est toujours démarré.

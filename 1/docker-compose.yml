@@ -1,0 +1,549 @@
+# =============================================================================
+# Dockerwarts N°1 — infrastructure dockerisée pour un projet big data
+#
+#   docker compose up -d
+#
+# Dix services, un seul fichier :
+#
+#   traefik        reverse proxy + pare-feu applicatif (TLS, filtrage IP, auth)
+#   db             MariaDB — base de GLPI
+#   glpi           ticketing
+#   elasticsearch  historisation des données
+#   kibana         exploration des données historisées
+#   cassandra      datalake
+#   prometheus     collecte des métriques
+#   grafana        monitoring et tableaux de bord
+#   node-exporter  métriques de la machine hôte
+#   cadvisor       métriques des conteneurs
+#
+# Deux réseaux :
+#   proxy    ce que Traefik expose (et le seul avec un accès sortant)
+#   backend  interne, sans route vers l'extérieur : bases et exporters
+#
+# Documentation : docs/01-architecture.md
+# =============================================================================
+
+# Nom de projet figé : sans lui, Compose le déduit du nom du répertoire et les
+# volumes changent de nom si l'on renomme le dossier — les sauvegardes de
+# scripts/backup.sh ne retrouveraient plus rien.
+name: dockerwarts
+
+# --- Blocs réutilisés ---------------------------------------------------------
+# Définis une fois pour que dix services ne divergent pas sur ces trois points.
+x-restart: &restart
+  # `unless-stopped` et non `always` : après un `docker compose stop` volontaire,
+  # les conteneurs ne redémarrent pas tout seuls au reboot de la machine.
+  restart: unless-stopped
+
+x-logging: &logging
+  logging:
+    driver: json-file
+    options:
+      # Sans limite, les journaux d'un conteneur bavard remplissent le disque
+      # et emportent toute la plateforme — panne classique et évitable.
+      max-size: "10m"
+      max-file: "3"
+
+services:
+
+  # ===========================================================================
+  # Traefik — point d'entrée unique et pare-feu applicatif
+  #
+  # Il découvre les services par leurs labels : ajouter un service exposé, c'est
+  # ajouter quatre labels, jamais toucher à sa configuration.
+  # ===========================================================================
+  traefik:
+    image: traefik:v3.7.13
+    <<: [*restart, *logging]
+    command:
+      - --providers.docker=true
+      # Un conteneur n'est exposé que s'il porte `traefik.enable=true` : par
+      # défaut, rien ne sort. C'est l'inverse qui serait dangereux.
+      - --providers.docker.exposedByDefault=false
+      - --providers.docker.network=dockerwarts_proxy
+      - --providers.file.filename=/etc/traefik/dynamic.yml
+      - --entrypoints.web.address=:80
+      # Tout le trafic HTTP est redirigé : aucun identifiant ne circule en clair.
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --entrypoints.websecure.address=:443
+      # Point d'entrée dédié aux métriques : il n'est PAS publié dans `ports`,
+      # donc joignable seulement depuis le réseau Docker — par Prometheus.
+      - --entrypoints.metrics.address=:8082
+      - --api.dashboard=true
+      - --metrics.prometheus=true
+      - --metrics.prometheus.entrypoint=metrics
+      # Le point /ping sert à la sonde de santé. Il doit être rattaché
+      # explicitement à un point d'entrée existant : par défaut Traefik le place
+      # sur l'entrée `traefik` (:8080), qui n'est pas définie ici — la sonde
+      # échouerait indéfiniment sur un « connection refused ».
+      - --ping=true
+      - --ping.entrypoint=metrics
+      - --accesslog=true
+      - --log.level=INFO
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      # Lecture seule : Traefik doit lire l'API Docker pour découvrir les
+      # services, il n'a aucune raison de pouvoir écrire dedans.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./config/traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro
+      # Produits par scripts/init.sh, jamais versionnés (voir .gitignore).
+      - ./certs:/etc/traefik/certs:ro
+      - ./secrets/users.htpasswd:/etc/traefik/users.htpasswd:ro
+    networks: [proxy]
+    healthcheck:
+      # L'image Traefik n'embarque ni curl ni wget : le binaire sait se sonder
+      # lui-même. Il faut lui redonner l'adresse du point d'entrée, qu'il ne
+      # lit pas depuis le processus en cours d'exécution.
+      test:
+        - CMD
+        - traefik
+        - healthcheck
+        - --ping
+        - --ping.entrypoint=metrics
+        - --entrypoints.metrics.address=:8082
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.dashboard.rule: "Host(`traefik.${DOMAIN}`)"
+      traefik.http.routers.dashboard.entrypoints: "websecure"
+      traefik.http.routers.dashboard.tls: "true"
+      traefik.http.routers.dashboard.service: "api@internal"
+      # Le tableau de bord expose la configuration complète du proxy : il est
+      # derrière la chaîne d'administration (filtrage IP + authentification).
+      traefik.http.routers.dashboard.middlewares: "admin-chain@docker"
+
+      # --- Les briques du pare-feu applicatif --------------------------------
+      # Déclarées ici, sur Traefik lui-même, et non dans dynamic.yml : le
+      # fournisseur « file » de Traefik ne remplace PAS les variables, alors que
+      # Compose le fait. C'est ce qui permet de régler ADMIN_CIDR dans .env
+      # au lieu d'éditer un fichier de configuration.
+
+      # Filtrage IP : la première barrière. Une requête d'ailleurs est refusée
+      # avant même qu'on lui demande un mot de passe.
+      traefik.http.middlewares.admin-ipallowlist.ipallowlist.sourcerange: "${ADMIN_CIDR}"
+
+      # Authentification HTTP. Le fichier est produit par scripts/init.sh :
+      # aucune empreinte de mot de passe ne se retrouve dans ce dépôt.
+      traefik.http.middlewares.admin-auth.basicauth.usersfile: "/etc/traefik/users.htpasswd"
+      traefik.http.middlewares.admin-auth.basicauth.realm: "Dockerwarts"
+
+      # En-têtes de sécurité appliqués à toutes les réponses.
+      traefik.http.middlewares.secure-headers.headers.stsseconds: "31536000"
+      traefik.http.middlewares.secure-headers.headers.stsincludesubdomains: "true"
+      traefik.http.middlewares.secure-headers.headers.frameDeny: "true"
+      traefik.http.middlewares.secure-headers.headers.contenttypenosniff: "true"
+      traefik.http.middlewares.secure-headers.headers.browserxssfilter: "true"
+      traefik.http.middlewares.secure-headers.headers.referrerpolicy: "strict-origin-when-cross-origin"
+      # Masque « Server: Apache/2.4.x » : inutile au client, précieux pour qui
+      # cherche une version vulnérable.
+      traefik.http.middlewares.secure-headers.headers.customresponseheaders.Server: ""
+      traefik.http.middlewares.secure-headers.headers.customresponseheaders.X-Powered-By: ""
+
+      # Limitation de débit : 100 requêtes/s en moyenne, rafales à 200.
+      # Ce n'est pas une protection anti-DDoS, c'est ce qui empêche un script
+      # d'énumérer les tickets ou de marteler la page de connexion.
+      traefik.http.middlewares.rate-limit.ratelimit.average: "100"
+      traefik.http.middlewares.rate-limit.ratelimit.burst: "200"
+      traefik.http.middlewares.rate-limit.ratelimit.period: "1s"
+
+      # --- Les trois chaînes utilisées par les routeurs ----------------------
+      # Application publique : ouverte, mais protégée.
+      traefik.http.middlewares.public-chain.chain.middlewares: "secure-headers,rate-limit"
+      # Outils d'administration sans authentification propre.
+      traefik.http.middlewares.admin-chain.chain.middlewares: "admin-ipallowlist,admin-auth,secure-headers"
+      # Outils d'administration qui authentifient eux-mêmes (Grafana).
+      traefik.http.middlewares.admin-chain-noauth.chain.middlewares: "admin-ipallowlist,secure-headers"
+    deploy:
+      resources:
+        limits: {memory: 256M}
+
+  # ===========================================================================
+  # MariaDB — la base de GLPI
+  # ===========================================================================
+  db:
+    image: mariadb:11.4.13
+    <<: [*restart, *logging]
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      # GLPI insère des lignes longues (contenus de tickets) : sans cela,
+      # certaines créations échouent avec « Row size too large ».
+      - --innodb-file-per-table=1
+    environment:
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+      MARIADB_DATABASE: ${DB_NAME}
+      MARIADB_USER: ${DB_USER}
+      MARIADB_PASSWORD: ${DB_PASSWORD}
+      TZ: ${TZ}
+    volumes:
+      - db_data:/var/lib/mysql
+    networks: [backend]
+    healthcheck:
+      # `healthcheck.sh --connect` est fourni par l'image : il ouvre une vraie
+      # connexion. Un simple test de port dirait « prêt » pendant que MariaDB
+      # rejoue encore ses journaux au démarrage.
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    deploy:
+      resources:
+        limits: {memory: 1G}
+
+  # ===========================================================================
+  # GLPI — l'outil de ticketing
+  #
+  # L'image officielle s'installe toute seule quand les cinq variables
+  # GLPI_DB_* sont fournies : pas d'assistant web à dérouler à la main.
+  # ===========================================================================
+  glpi:
+    image: glpi/glpi:10.0.26
+    <<: [*restart, *logging]
+    environment:
+      GLPI_DB_HOST: db
+      GLPI_DB_PORT: "3306"
+      GLPI_DB_NAME: ${DB_NAME}
+      GLPI_DB_USER: ${DB_USER}
+      GLPI_DB_PASSWORD: ${DB_PASSWORD}
+      TZ: ${TZ}
+    volumes:
+      - glpi_files:/var/www/glpi/files
+      - glpi_config:/var/www/glpi/config
+      - glpi_plugins:/var/www/glpi/plugins
+      - glpi_marketplace:/var/www/glpi/marketplace
+    networks: [proxy, backend]
+    depends_on:
+      # `service_healthy` et non `service_started` : démarré ne veut pas dire
+      # prêt, et l'auto-installation de GLPI échoue sur une base qui n'accepte
+      # pas encore de connexion.
+      db:
+        condition: service_healthy
+    healthcheck:
+      # status.php ne répond `GLPI_OK` que si la base répond aussi : une page
+      # d'accueil en 200 servie par Apache seul masquerait une base coupée.
+      test: ["CMD-SHELL", "curl -sf http://localhost/status.php | grep -q GLPI_OK"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.glpi.rule: "Host(`glpi.${DOMAIN}`)"
+      traefik.http.routers.glpi.entrypoints: "websecure"
+      traefik.http.routers.glpi.tls: "true"
+      # GLPI est l'application destinée aux utilisateurs : pas de filtrage IP,
+      # mais en-têtes de sécurité et limitation de débit.
+      traefik.http.routers.glpi.middlewares: "public-chain@docker"
+      traefik.http.services.glpi.loadbalancer.server.port: "80"
+      # Cookie de session collant : indispensable dès qu'on lance plusieurs
+      # instances (docker compose up -d --scale glpi=2), sinon une requête sur
+      # deux tombe sur l'autre conteneur et déconnecte l'utilisateur.
+      traefik.http.services.glpi.loadbalancer.sticky.cookie: "true"
+      traefik.http.services.glpi.loadbalancer.sticky.cookie.name: "glpi_srv"
+      traefik.http.services.glpi.loadbalancer.healthcheck.path: "/status.php"
+    deploy:
+      resources:
+        limits: {memory: 1G}
+
+  # ===========================================================================
+  # Elasticsearch — historisation des données
+  # ===========================================================================
+  elasticsearch:
+    image: elasticsearch:8.19.21
+    <<: [*restart, *logging]
+    environment:
+      # Un seul nœud : Elasticsearch saute l'élection de maître, qui n'aurait
+      # aucun sens ici et bloquerait le démarrage.
+      discovery.type: single-node
+      # Sécurité désactivée : la plateforme tient sur une machine, ce port
+      # n'est joignable que depuis le réseau `backend`, qui n'a aucune route
+      # vers l'extérieur. Choix assumé et expliqué dans docs/03-securite.md.
+      xpack.security.enabled: "false"
+      # Heap fixe, et surtout Xms = Xmx : une JVM qui redimensionne son tas
+      # sous charge provoque des pauses que l'on met des heures à diagnostiquer.
+      ES_JAVA_OPTS: "-Xms${ES_HEAP} -Xmx${ES_HEAP}"
+      # Répertoire de destination des snapshots (voir scripts/backup.sh).
+      #
+      # Il est SOUS le volume de données, et non dans un volume à lui : Docker
+      # crée un volume neuf en `root:root` quand le point de montage n'existe
+      # pas dans l'image, or Elasticsearch tourne en uid 1000 et n'aurait alors
+      # pas le droit d'y écrire. `/usr/share/elasticsearch/data` existe dans
+      # l'image et appartient déjà à elasticsearch : le sous-répertoire hérite
+      # des bons droits, sans conteneur d'initialisation pour faire un chown.
+      path.repo: "/usr/share/elasticsearch/data/snapshots"
+      # Seuils d'occupation disque en valeurs ABSOLUES et non en pourcentage.
+      # Par défaut, Elasticsearch refuse d'allouer le moindre shard dès 90 %
+      # d'occupation : sur un disque de 250 Go, cela veut dire tomber en état
+      # « red » alors qu'il reste 25 Go parfaitement utilisables. Elastic
+      # recommande les valeurs absolues sur les gros volumes, exactement pour
+      # cette raison.
+      cluster.routing.allocation.disk.watermark.low: "5gb"
+      cluster.routing.allocation.disk.watermark.high: "3gb"
+      cluster.routing.allocation.disk.watermark.flood_stage: "2gb"
+      TZ: ${TZ}
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    networks: [backend]
+    healthcheck:
+      # `yellow` est l'état NORMAL d'un nœud unique : les replicas ne peuvent
+      # pas être alloués ailleurs. Exiger `green` laisserait le service pour
+      # toujours en « unhealthy ».
+      test: ["CMD-SHELL", "curl -sf 'http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=5s' >/dev/null"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    deploy:
+      resources:
+        limits: {memory: 2G}
+
+  # ===========================================================================
+  # Kibana — exploration des données historisées
+  # ===========================================================================
+  kibana:
+    image: kibana:8.19.21
+    <<: [*restart, *logging]
+    environment:
+      ELASTICSEARCH_HOSTS: "http://elasticsearch:9200"
+      TZ: ${TZ}
+    networks: [proxy, backend]
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:5601/api/status | grep -q '\"level\":\"available\"'"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 90s
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.kibana.rule: "Host(`kibana.${DOMAIN}`)"
+      traefik.http.routers.kibana.entrypoints: "websecure"
+      traefik.http.routers.kibana.tls: "true"
+      traefik.http.routers.kibana.middlewares: "admin-chain@docker"
+      traefik.http.services.kibana.loadbalancer.server.port: "5601"
+    deploy:
+      resources:
+        limits: {memory: 1G}
+
+  # ===========================================================================
+  # Cassandra — le datalake
+  # ===========================================================================
+  cassandra:
+    image: cassandra:5.0.9
+    <<: [*restart, *logging]
+    environment:
+      CASSANDRA_CLUSTER_NAME: dockerwarts
+      # Les deux variables vont ensemble : ne définir que MAX_HEAP_SIZE fait
+      # échouer le démarrage de Cassandra.
+      MAX_HEAP_SIZE: ${CASSANDRA_HEAP}
+      HEAP_NEWSIZE: ${CASSANDRA_NEWSIZE}
+      TZ: ${TZ}
+    volumes:
+      - cassandra_data:/var/lib/cassandra
+    networks: [backend]
+    healthcheck:
+      # Une vraie requête CQL, et non `nodetool status`. Nuance mesurée sur
+      # cette plateforme : nodetool annonce le nœud « UN » (Up/Normal) une
+      # trentaine de secondes AVANT que le transport natif accepte des
+      # connexions sur le port 9042. Avec la sonde nodetool, `cassandra-init`
+      # démarrait sur un service déclaré sain et échouait en « Connection
+      # refused ». Seule une requête prouve que le nœud sert vraiment.
+      test: ["CMD-SHELL", "cqlsh -e 'SELECT now() FROM system.local' >/dev/null 2>&1"]
+      interval: 30s
+      timeout: 15s
+      retries: 10
+      start_period: 120s
+    deploy:
+      resources:
+        limits: {memory: 2G}
+
+  # ===========================================================================
+  # cassandra-init — crée le keyspace et les tables, une fois
+  #
+  # `restart: "no"` : ce conteneur DOIT sortir. C'est un travail ponctuel, pas
+  # un service, et le relancer en boucle n'aurait aucun sens.
+  # ===========================================================================
+  cassandra-init:
+    image: cassandra:5.0.9
+    restart: "no"
+    <<: *logging
+    command: ["cqlsh", "cassandra", "-f", "/init.cql"]
+    volumes:
+      - ./config/cassandra/init.cql:/init.cql:ro
+    networks: [backend]
+    depends_on:
+      cassandra:
+        condition: service_healthy
+
+  # ===========================================================================
+  # Prometheus — collecte des métriques
+  # ===========================================================================
+  prometheus:
+    image: prom/prometheus:v3.13.3
+    <<: [*restart, *logging]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+      - --web.enable-lifecycle
+    volumes:
+      - ./config/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./config/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    networks: [proxy, backend]
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.prometheus.rule: "Host(`prometheus.${DOMAIN}`)"
+      traefik.http.routers.prometheus.entrypoints: "websecure"
+      traefik.http.routers.prometheus.tls: "true"
+      # Prometheus n'a AUCUNE authentification native et son interface expose
+      # toutes les métriques de la plateforme : la chaîne d'administration
+      # (filtrage IP + mot de passe) n'est pas optionnelle ici.
+      traefik.http.routers.prometheus.middlewares: "admin-chain@docker"
+      traefik.http.services.prometheus.loadbalancer.server.port: "9090"
+    deploy:
+      resources:
+        limits: {memory: 1G}
+
+  # ===========================================================================
+  # Grafana — monitoring
+  # ===========================================================================
+  grafana:
+    image: grafana/grafana:13.0.8
+    <<: [*restart, *logging]
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD}
+      GF_SERVER_ROOT_URL: "https://grafana.${DOMAIN}"
+      # Personne ne consulte les tableaux de bord sans compte.
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      TZ: ${TZ}
+    volumes:
+      - ./config/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./config/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    networks: [proxy, backend]
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.grafana.rule: "Host(`grafana.${DOMAIN}`)"
+      traefik.http.routers.grafana.entrypoints: "websecure"
+      traefik.http.routers.grafana.tls: "true"
+      # Grafana authentifie lui-même : filtrage IP et en-têtes, mais pas de
+      # double mot de passe qui n'apporterait rien.
+      traefik.http.routers.grafana.middlewares: "admin-chain-noauth@docker"
+      traefik.http.services.grafana.loadbalancer.server.port: "3000"
+    deploy:
+      resources:
+        limits: {memory: 512M}
+
+  # ===========================================================================
+  # node-exporter — métriques de la machine hôte
+  # ===========================================================================
+  node-exporter:
+    image: prom/node-exporter:v1.12.1
+    <<: [*restart, *logging]
+    command:
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --path.rootfs=/host/root
+      - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|var/lib/docker/.+)($$|/)
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host/root:ro
+    networks: [backend]
+    pid: host
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9100/metrics"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits: {memory: 128M}
+
+  # ===========================================================================
+  # cAdvisor — métriques par conteneur
+  # ===========================================================================
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.55.1
+    <<: [*restart, *logging]
+    command:
+      # Sans ces exclusions, cAdvisor produit des milliers de séries dont
+      # personne ne regarde une seule, et Prometheus grossit pour rien.
+      - --docker_only=true
+      - --housekeeping_interval=30s
+      - --disable_metrics=percpu,sched,tcp,udp,advtcp,process,hugetlb,referenced_memory,cpu_topology,resctrl
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+      - /dev/disk:/dev/disk:ro
+    networks: [backend]
+    privileged: true
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits: {memory: 256M}
+
+# =============================================================================
+# Réseaux
+# =============================================================================
+networks:
+  # Ce que Traefik expose, et le seul réseau avec une route vers l'extérieur.
+  proxy:
+    name: dockerwarts_proxy
+    driver: bridge
+
+  # `internal: true` retire la passerelle par défaut : un conteneur compromis
+  # sur ce réseau ne peut RIEN joindre à l'extérieur, quoi qu'il exécute.
+  # C'est la mesure de segmentation la plus efficace de ce fichier.
+  backend:
+    name: dockerwarts_backend
+    driver: bridge
+    internal: true
+
+# =============================================================================
+# Volumes — tout ce qui doit survivre à `docker compose down`
+# =============================================================================
+volumes:
+  db_data:
+  glpi_files:
+  glpi_config:
+  glpi_plugins:
+  glpi_marketplace:
+  es_data:
+  cassandra_data:
+  prometheus_data:
+  grafana_data:

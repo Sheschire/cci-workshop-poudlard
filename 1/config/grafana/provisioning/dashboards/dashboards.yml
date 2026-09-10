@@ -1,0 +1,17 @@
+# Charge les tableaux de bord depuis le disque au lieu de les créer à la main.
+# Ils sont ainsi versionnés avec le reste de l'infrastructure : une machine
+# reconstruite retrouve les mêmes écrans.
+apiVersion: 1
+
+providers:
+  - name: dockerwarts
+    orgId: 1
+    folder: Dockerwarts
+    type: file
+    # `false` : un tableau de bord supprimé du dossier disparaît aussi de
+    # Grafana. Le disque est la référence, pas la base interne.
+    disableDeletion: false
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

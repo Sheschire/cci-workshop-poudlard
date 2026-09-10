@@ -1,0 +1,42 @@
+# =============================================================================
+# Traefik — configuration dynamique (fournisseur « file »)
+#
+# Ce fichier ne contient QUE ce qui ne dépend d'aucune variable : le certificat
+# et les réglages TLS. Tout le reste — routeurs, middlewares, chaînes — est
+# déclaré par des labels dans docker-compose.yml, parce que le fournisseur
+# « file » de Traefik ne remplace pas les variables d'environnement, alors que
+# Compose le fait.
+#
+# Traefik relit ce fichier à chaud : le modifier ne demande aucun redémarrage.
+# =============================================================================
+
+tls:
+  # Certificat présenté par défaut pour tous les noms d'hôte. Il est produit
+  # par scripts/init.sh et auto-signé : le navigateur affichera un
+  # avertissement, ce qui est normal en local. En production, on remplace ce
+  # bloc par un resolver ACME (Let's Encrypt) — voir docs/03-securite.md.
+  stores:
+    default:
+      defaultCertificate:
+        certFile: /etc/traefik/certs/dockerwarts.crt
+        keyFile: /etc/traefik/certs/dockerwarts.key
+
+  options:
+    default:
+      # TLS 1.2 au minimum : SSLv3, TLS 1.0 et 1.1 sont cassés et refusés par
+      # les navigateurs récents de toute façon.
+      minVersion: VersionTLS12
+      # Suites retenues pour TLS 1.2 : uniquement de l'AEAD avec échange de
+      # clés éphémère (confidentialité persistante). TLS 1.3 choisit seul ses
+      # suites, cette liste ne le concerne pas.
+      cipherSuites:
+        - TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+        - TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+        - TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+        - TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+        - TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305
+        - TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305
+      curvePreferences:
+        - CurveP256
+        - X25519
+      sniStrict: false
