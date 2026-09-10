@@ -1,0 +1,7 @@
+/Users/sheschire/Documents/Campus/cci-workshop-poudlard/14/build/CMakeFiles/rogue-box.dir
+/Users/sheschire/Documents/Campus/cci-workshop-poudlard/14/build/CMakeFiles/edit_cache.dir
+/Users/sheschire/Documents/Campus/cci-workshop-poudlard/14/build/CMakeFiles/rebuild_cache.dir
+/Users/sheschire/Documents/Campus/cci-workshop-poudlard/14/build/CMakeFiles/list_install_components.dir
+/Users/sheschire/Documents/Campus/cci-workshop-poudlard/14/build/CMakeFiles/install.dir
+/Users/sheschire/Documents/Campus/cci-workshop-poudlard/14/build/CMakeFiles/install/local.dir
+/Users/sheschire/Documents/Campus/cci-workshop-poudlard/14/build/CMakeFiles/install/strip.dir
