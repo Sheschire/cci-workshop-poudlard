@@ -1,0 +1,693 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+  <title>Chargement magique</title>
+
+  <style>
+    :root {
+      --blue: #8cecff;
+      --cyan: #b8f7ff;
+      --deep-blue: #061326;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+    }
+
+    body {
+      overflow: hidden;
+      background:
+        radial-gradient(
+          circle at center,
+          #0b2940 0%,
+          #061525 42%,
+          #020914 100%
+        );
+
+      font-family: system-ui, sans-serif;
+    }
+
+    .loader {
+      position: relative;
+      width: 100%;
+      height: 100%;
+      min-height: 100svh;
+
+      display: grid;
+      place-items: center;
+
+      isolation: isolate;
+      overflow: hidden;
+    }
+
+    /* --------------------------------------------------
+       Halo
+    -------------------------------------------------- */
+
+    .halo {
+      position: absolute;
+
+      width: min(52vw, 560px);
+      aspect-ratio: 1;
+
+      border-radius: 50%;
+
+      background:
+        radial-gradient(
+          circle,
+          rgba(150, 239, 255, 0.32) 0%,
+          rgba(83, 213, 255, 0.18) 25%,
+          rgba(45, 169, 221, 0.08) 48%,
+          transparent 72%
+        );
+
+      filter: blur(18px);
+
+      animation: haloPulse 3s ease-in-out infinite;
+
+      z-index: -2;
+    }
+
+    .halo::before,
+    .halo::after {
+      content: "";
+
+      position: absolute;
+      inset: 5%;
+
+      border-radius: 50%;
+
+      border: 1px solid rgba(154, 239, 255, 0.2);
+
+      animation: ringPulse 3s ease-out infinite;
+    }
+
+    .halo::after {
+      inset: -8%;
+      opacity: 0.45;
+      animation-delay: 1.5s;
+    }
+
+    @keyframes haloPulse {
+      0%,
+      100% {
+        transform: scale(0.88);
+        opacity: 0.65;
+      }
+
+      50% {
+        transform: scale(1.08);
+        opacity: 1;
+      }
+    }
+
+    @keyframes ringPulse {
+      0% {
+        transform: scale(0.75);
+        opacity: 0;
+      }
+
+      20% {
+        opacity: 0.55;
+      }
+
+      100% {
+        transform: scale(1.35);
+        opacity: 0;
+      }
+    }
+
+    /* --------------------------------------------------
+       Renard
+    -------------------------------------------------- */
+
+    .fox {
+      position: relative;
+
+      width: min(31vw, 350px);
+      min-width: 220px;
+
+      filter:
+        drop-shadow(0 0 8px rgba(139, 238, 255, 0.8))
+        drop-shadow(0 0 28px rgba(73, 207, 255, 0.55));
+
+      animation:
+        foxFloat 4s ease-in-out infinite,
+        foxGlow 3s ease-in-out infinite;
+
+      z-index: 2;
+    }
+
+    .fox svg {
+      display: block;
+      width: 100%;
+      height: auto;
+      overflow: visible;
+    }
+
+    @keyframes foxFloat {
+      0%,
+      100% {
+        transform: translateY(7px);
+      }
+
+      50% {
+        transform: translateY(-7px);
+      }
+    }
+
+    @keyframes foxGlow {
+      0%,
+      100% {
+        filter:
+          drop-shadow(0 0 7px rgba(139, 238, 255, 0.75))
+          drop-shadow(0 0 22px rgba(73, 207, 255, 0.45));
+      }
+
+      50% {
+        filter:
+          drop-shadow(0 0 12px rgba(190, 250, 255, 1))
+          drop-shadow(0 0 42px rgba(73, 207, 255, 0.75));
+      }
+    }
+
+    /* --------------------------------------------------
+       Particules
+    -------------------------------------------------- */
+
+    .particles {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      z-index: 1;
+    }
+
+    .particle {
+      position: absolute;
+
+      width: 3px;
+      height: 3px;
+
+      border-radius: 50%;
+
+      background: #c8faff;
+
+      box-shadow:
+        0 0 6px #9befff,
+        0 0 14px #52dfff;
+
+      opacity: 0;
+
+      animation: particleFloat linear infinite;
+    }
+
+    .particle:nth-child(1) {
+      left: 28%;
+      bottom: 25%;
+      animation-duration: 5s;
+      animation-delay: -1s;
+    }
+
+    .particle:nth-child(2) {
+      left: 35%;
+      bottom: 18%;
+      animation-duration: 6s;
+      animation-delay: -4s;
+    }
+
+    .particle:nth-child(3) {
+      left: 42%;
+      bottom: 30%;
+      animation-duration: 4.5s;
+      animation-delay: -2s;
+    }
+
+    .particle:nth-child(4) {
+      left: 57%;
+      bottom: 22%;
+      animation-duration: 5.5s;
+      animation-delay: -3s;
+    }
+
+    .particle:nth-child(5) {
+      left: 65%;
+      bottom: 28%;
+      animation-duration: 7s;
+      animation-delay: -5s;
+    }
+
+    .particle:nth-child(6) {
+      left: 71%;
+      bottom: 18%;
+      animation-duration: 5s;
+      animation-delay: -2.5s;
+    }
+
+    .particle:nth-child(7) {
+      left: 30%;
+      bottom: 45%;
+      animation-duration: 8s;
+      animation-delay: -6s;
+    }
+
+    .particle:nth-child(8) {
+      left: 70%;
+      bottom: 40%;
+      animation-duration: 6s;
+      animation-delay: -4s;
+    }
+
+    .particle:nth-child(9) {
+      left: 47%;
+      bottom: 12%;
+      animation-duration: 7s;
+      animation-delay: -1.5s;
+    }
+
+    .particle:nth-child(10) {
+      left: 53%;
+      bottom: 35%;
+      animation-duration: 5s;
+      animation-delay: -3.5s;
+    }
+
+    @keyframes particleFloat {
+      0% {
+        transform:
+          translate3d(0, 30px, 0)
+          scale(0.3);
+
+        opacity: 0;
+      }
+
+      20% {
+        opacity: 0.8;
+      }
+
+      70% {
+        opacity: 0.5;
+      }
+
+      100% {
+        transform:
+          translate3d(
+            calc(var(--drift, 0) * 1px),
+            -180px,
+            0
+          )
+          scale(1);
+
+        opacity: 0;
+      }
+    }
+
+    /* --------------------------------------------------
+       Texte
+    -------------------------------------------------- */
+
+    .loading {
+      position: absolute;
+
+      left: 50%;
+      bottom: 9%;
+
+      transform: translateX(-50%);
+
+      color: rgba(210, 249, 255, 0.8);
+
+      font-size: 11px;
+      font-weight: 500;
+
+      letter-spacing: 0.35em;
+      text-transform: uppercase;
+
+      white-space: nowrap;
+
+      animation: textPulse 2.5s ease-in-out infinite;
+    }
+
+    @keyframes textPulse {
+      0%,
+      100% {
+        opacity: 0.35;
+      }
+
+      50% {
+        opacity: 0.9;
+      }
+    }
+
+    /* --------------------------------------------------
+       Vignette
+    -------------------------------------------------- */
+
+    .vignette {
+      position: absolute;
+      inset: 0;
+
+      pointer-events: none;
+
+      background:
+        radial-gradient(
+          circle,
+          transparent 30%,
+          rgba(0, 5, 15, 0.15) 65%,
+          rgba(0, 3, 10, 0.72) 100%
+        );
+
+      z-index: 5;
+    }
+
+    /* --------------------------------------------------
+       Mobile
+    -------------------------------------------------- */
+
+    @media (max-width: 600px) {
+      .halo {
+        width: 85vw;
+      }
+
+      .fox {
+        width: 62vw;
+        min-width: 0;
+      }
+
+      .loading {
+        bottom: 7%;
+        font-size: 9px;
+      }
+    }
+
+    /* Accessibilité */
+    @media (prefers-reduced-motion: reduce) {
+      .halo,
+      .halo::before,
+      .halo::after,
+      .fox,
+      .particle,
+      .loading {
+        animation: none;
+      }
+    }
+  </style>
+</head>
+
+<body>
+
+  <main class="loader">
+
+    <div class="halo"></div>
+
+    <div class="particles" aria-hidden="true">
+      <span class="particle"></span>
+      <span class="particle"></span>
+      <span class="particle"></span>
+      <span class="particle"></span>
+      <span class="particle"></span>
+      <span class="particle"></span>
+      <span class="particle"></span>
+      <span class="particle"></span>
+      <span class="particle"></span>
+      <span class="particle"></span>
+    </div>
+
+    <div class="fox" aria-label="Renard magique">
+
+      <svg
+        viewBox="0 0 400 460"
+        xmlns="http://www.w3.org/2000/svg"
+        role="img"
+      >
+
+        <defs>
+
+          <linearGradient
+            id="foxGradient"
+            x1="0"
+            y1="0"
+            x2="1"
+            y2="1"
+          >
+            <stop offset="0%" stop-color="#ffffff" />
+            <stop offset="35%" stop-color="#b9f7ff" />
+            <stop offset="70%" stop-color="#6ddfff" />
+            <stop offset="100%" stop-color="#269bd1" />
+          </linearGradient>
+
+          <linearGradient
+            id="tailGradient"
+            x1="0"
+            y1="1"
+            x2="1"
+            y2="0"
+          >
+            <stop offset="0%" stop-color="#218cc1" />
+            <stop offset="55%" stop-color="#8eeeff" />
+            <stop offset="100%" stop-color="#ffffff" />
+          </linearGradient>
+
+          <filter id="softGlow">
+            <feGaussianBlur
+              stdDeviation="4"
+              result="blur"
+            />
+
+            <feMerge>
+              <feMergeNode in="blur" />
+              <feMergeNode in="SourceGraphic" />
+            </feMerge>
+          </filter>
+
+        </defs>
+
+        <!-- Aura interne -->
+        <ellipse
+          cx="205"
+          cy="425"
+          rx="105"
+          ry="15"
+          fill="#7deaff"
+          opacity="0.15"
+          filter="url(#softGlow)"
+        />
+
+        <!-- Queue -->
+        <path
+          d="
+            M180 325
+            C110 335 45 390 75 425
+            C95 448 140 425 158 393
+            C175 364 198 347 222 338
+          "
+          fill="none"
+          stroke="url(#tailGradient)"
+          stroke-width="34"
+          stroke-linecap="round"
+          filter="url(#softGlow)"
+        />
+
+        <!-- Corps -->
+        <path
+          d="
+            M155 205
+            C126 230 117 281 135 333
+            C147 368 177 397 215 398
+            C252 398 283 370 288 331
+            C294 284 278 235 245 207
+            C220 187 180 185 155 205Z
+          "
+          fill="url(#foxGradient)"
+          opacity="0.86"
+          filter="url(#softGlow)"
+        />
+
+        <!-- Poitrine -->
+        <path
+          d="
+            M175 250
+            C160 292 168 349 203 381
+            C232 350 242 297 225 250
+            C211 230 190 231 175 250Z
+          "
+          fill="#e8fcff"
+          opacity="0.55"
+        />
+
+        <!-- Tête -->
+        <path
+          d="
+            M130 92
+            L142 35
+            L182 75
+            C195 70 213 70 228 76
+            L267 35
+            L273 103
+            C294 120 299 151 286 178
+            C269 214 235 230 200 230
+            C164 230 130 211 116 179
+            C103 149 109 116 130 92Z
+          "
+          fill="url(#foxGradient)"
+          opacity="0.9"
+          filter="url(#softGlow)"
+        />
+
+        <!-- Oreille gauche -->
+        <path
+          d="
+            M142 84
+            L145 49
+            L177 80
+            Z
+          "
+          fill="#d9fbff"
+          opacity="0.8"
+        />
+
+        <!-- Oreille droite -->
+        <path
+          d="
+            M228 81
+            L263 48
+            L267 91
+            Z
+          "
+          fill="#d9fbff"
+          opacity="0.8"
+        />
+
+        <!-- Museau -->
+        <path
+          d="
+            M156 153
+            C174 139 226 139 246 153
+            C235 185 218 202 201 204
+            C183 201 164 183 156 153Z
+          "
+          fill="#dffcff"
+          opacity="0.45"
+        />
+
+        <!-- Nez -->
+        <path
+          d="
+            M190 170
+            Q200 162 210 170
+            Q206 180 200 182
+            Q194 180 190 170Z
+          "
+          fill="#ffffff"
+        />
+
+        <!-- Yeux -->
+        <ellipse
+          cx="163"
+          cy="136"
+          rx="7"
+          ry="5"
+          fill="#ffffff"
+        />
+
+        <ellipse
+          cx="237"
+          cy="136"
+          rx="7"
+          ry="5"
+          fill="#ffffff"
+        />
+
+        <!-- Reflets des yeux -->
+        <circle
+          cx="164"
+          cy="135"
+          r="2"
+          fill="#49dfff"
+        />
+
+        <circle
+          cx="238"
+          cy="135"
+          r="2"
+          fill="#49dfff"
+        />
+
+        <!-- Pattes -->
+        <path
+          d="
+            M157 322
+            C145 352 142 384 151 407
+          "
+          fill="none"
+          stroke="#8eeeff"
+          stroke-width="15"
+          stroke-linecap="round"
+          opacity="0.8"
+        />
+
+        <path
+          d="
+            M252 322
+            C263 352 264 384 255 407
+          "
+          fill="none"
+          stroke="#8eeeff"
+          stroke-width="15"
+          stroke-linecap="round"
+          opacity="0.8"
+        />
+
+        <!-- Traits énergétiques -->
+        <path
+          d="M119 208 Q95 245 108 278"
+          fill="none"
+          stroke="#b9f7ff"
+          stroke-width="3"
+          opacity="0.5"
+        />
+
+        <path
+          d="M282 208 Q305 245 292 278"
+          fill="none"
+          stroke="#b9f7ff"
+          stroke-width="3"
+          opacity="0.5"
+        />
+
+      </svg>
+
+    </div>
+
+    <div class="loading">
+      Invocation en cours…
+    </div>
+
+    <div class="vignette"></div>
+
+  </main>
+
+  <script>
+    /*
+      Petit système de particules avec dérive aléatoire.
+    */
+
+    document.querySelectorAll(".particle").forEach((particle) => {
+      const drift = Math.random() * 100 - 50;
+      const scale = 0.5 + Math.random();
+
+      particle.style.setProperty("--drift", drift);
+      particle.style.transform = `scale(${scale})`;
+    });
+  </script>
+
+</body>
+</html>

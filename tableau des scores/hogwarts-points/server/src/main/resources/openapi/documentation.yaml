@@ -1,0 +1,67 @@
+openapi: 3.0.3
+info:
+  title: Hogwarts Points API
+  version: 1.0.0
+  description: API REST de gestion des points des quatre maisons.
+servers:
+  - url: http://localhost:8080
+paths:
+  /api/health:
+    get:
+      summary: Vérifie que l'API fonctionne
+      responses:
+        '200':
+          description: API disponible
+  /api/houses:
+    get:
+      summary: Retourne le classement
+      responses:
+        '200':
+          description: Liste des maisons
+  /api/scores:
+    get:
+      summary: Retourne l'historique
+      responses:
+        '200':
+          description: Liste des mouvements
+    post:
+      summary: Ajoute ou retire des points
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddScoreRequest'
+      responses:
+        '201':
+          description: Mouvement créé
+        '400':
+          description: Requête invalide
+  /api/scores/last:
+    delete:
+      summary: Annule la dernière opération
+      responses:
+        '200':
+          description: Opération annulée
+  /api/scores/reset:
+    post:
+      summary: Réinitialise la Coupe
+      responses:
+        '204':
+          description: Scores supprimés
+components:
+  schemas:
+    AddScoreRequest:
+      type: object
+      required: [houseId, points, reason]
+      properties:
+        houseId:
+          type: integer
+          format: int64
+        points:
+          type: integer
+          minimum: -100
+          maximum: 100
+        reason:
+          type: string
+          maxLength: 120

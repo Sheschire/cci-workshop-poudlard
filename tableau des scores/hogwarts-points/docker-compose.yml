@@ -1,0 +1,21 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: hogwarts-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: hogwarts
+      POSTGRES_USER: hogwarts
+      POSTGRES_PASSWORD: hogwarts_dev
+    ports:
+      - "5432:5432"
+    volumes:
+      - hogwarts_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hogwarts -d hogwarts"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  hogwarts_pgdata:
