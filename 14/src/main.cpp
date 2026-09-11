@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <array>
 #include <sstream>
+#include <unistd.h>
 
 #ifdef _WIN32
     #define popen _popen
@@ -75,6 +76,30 @@ bool isGitRepo() {
     int exitCode;
     execCommand("git rev-parse --is-inside-work-tree", exitCode);
     return exitCode == 0;
+}
+
+/**
+ * Obtient la racine du repository git
+ */
+std::string getGitRoot() {
+    int exitCode;
+    std::string root = execCommand("git rev-parse --show-toplevel", exitCode);
+    // Supprimer le retour a la ligne
+    if (!root.empty() && root.back() == '\n') {
+        root.pop_back();
+    }
+    return exitCode == 0 ? root : "";
+}
+
+/**
+ * Change vers la racine du repository git
+ */
+bool changeToGitRoot() {
+    std::string root = getGitRoot();
+    if (root.empty()) {
+        return false;
+    }
+    return chdir(root.c_str()) == 0;
 }
 
 /**
@@ -363,6 +388,12 @@ int main(int argc, char* argv[]) {
     if (!isGitRepo()) {
         std::cout << Color::RED << "\n  Erreur: Ce repertoire n'est pas un repository git.\n";
         std::cout << "  Executez 'git init' ou naviguez vers un repo existant.\n\n" << Color::RESET;
+        return 1;
+    }
+
+    // Se deplacer vers la racine du repo pour capturer TOUS les changements
+    if (!changeToGitRoot()) {
+        std::cout << Color::RED << "\n  Erreur: Impossible de se deplacer vers la racine du repository.\n\n" << Color::RESET;
         return 1;
     }
 
