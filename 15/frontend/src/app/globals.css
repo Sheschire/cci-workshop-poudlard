@@ -1,0 +1,45 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --foreground-rgb: 32, 38, 48;
+  --background-start-rgb: 245, 247, 250;
+  --background-end-rgb: 235, 238, 243;
+}
+
+body {
+  color: rgb(var(--foreground-rgb));
+  background: linear-gradient(
+    to bottom,
+    rgb(var(--background-start-rgb)),
+    rgb(var(--background-end-rgb))
+  );
+  min-height: 100vh;
+}
+
+@layer components {
+  .btn-primary {
+    @apply bg-hedwige-600 hover:bg-hedwige-700 text-white font-medium py-2 px-4 rounded-lg transition-colors duration-200;
+  }
+
+  .btn-secondary {
+    @apply bg-hedwige-100 hover:bg-hedwige-200 text-hedwige-800 font-medium py-2 px-4 rounded-lg transition-colors duration-200;
+  }
+
+  .card {
+    @apply bg-white rounded-xl shadow-sm border border-hedwige-100 p-6;
+  }
+
+  .input {
+    @apply w-full px-4 py-2 border border-hedwige-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-hedwige-500 focus:border-transparent;
+  }
+
+  .nav-link {
+    @apply px-4 py-2 rounded-lg text-hedwige-700 hover:bg-hedwige-100 transition-colors duration-200;
+  }
+
+  .nav-link-active {
+    @apply bg-hedwige-600 text-white hover:bg-hedwige-700;
+  }
+}
